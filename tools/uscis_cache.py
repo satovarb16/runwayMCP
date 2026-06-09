@@ -8,7 +8,9 @@ from tools._utils import normalize_company
 # For newer data, drop the file at CACHE_PATH manually (downloaded from
 # https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub
 # via Crosstab View → Download CSV).
-CACHE_URL = "https://www.uscis.gov/sites/default/files/document/data/h1b_datahubexport-2023.csv"
+CACHE_URL = (
+    "https://www.uscis.gov/sites/default/files/document/data/h1b_datahubexport-2023.csv"
+)
 CACHE_PATH = Path.home() / ".cache" / "runway-mcp" / "uscis_h1b.csv"
 _INDEX: dict | None = None
 
@@ -85,5 +87,7 @@ def get_employer_index() -> dict:
     except Exception:
         return {}
 
-    _INDEX = {k: v for k, v in index.items() if v["approvals"] + v["denials"] >= MIN_FILINGS}
+    _INDEX = {
+        k: v for k, v in index.items() if v["approvals"] + v["denials"] >= MIN_FILINGS
+    }
     return _INDEX

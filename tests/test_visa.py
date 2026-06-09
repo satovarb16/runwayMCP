@@ -54,18 +54,23 @@ def test_filing_count_non_negative():
 # T-03 — compute_verdict threshold tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.contract
-@pytest.mark.parametrize("filings,rate,expected", [
-    (15, 0.95, Verdict.GREEN),   # active sponsor
-    (5, 0.85, Verdict.GREEN),    # exactly at GREEN threshold
-    (5, 0.75, Verdict.YELLOW),   # filings ok but rate below 0.80
-    (1, 0.60, Verdict.YELLOW),   # has history, rate ok
-    (0, 0.0, Verdict.RED),       # no filings
-    (3, 0.40, Verdict.RED),      # low rate below 0.50
-])
+@pytest.mark.parametrize(
+    "filings,rate,expected",
+    [
+        (15, 0.95, Verdict.GREEN),  # active sponsor
+        (5, 0.85, Verdict.GREEN),  # exactly at GREEN threshold
+        (5, 0.75, Verdict.YELLOW),  # filings ok but rate below 0.80
+        (1, 0.60, Verdict.YELLOW),  # has history, rate ok
+        (0, 0.0, Verdict.RED),  # no filings
+        (3, 0.40, Verdict.RED),  # low rate below 0.50
+    ],
+)
 def test_compute_verdict(filings, rate, expected):
     """compute_verdict must map (filings, rate) to the correct Verdict."""
     from tools.visa import compute_verdict
+
     assert compute_verdict(filings, rate) == expected
 
 
@@ -73,10 +78,12 @@ def test_compute_verdict(filings, rate, expected):
 # T-04 — _normalize tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.contract
 def test_normalize_strips_suffix():
     """_normalize must strip legal suffixes like 'LLC'."""
     from tools.visa import _normalize
+
     assert _normalize("Google LLC") == "google"
 
 
@@ -84,12 +91,14 @@ def test_normalize_strips_suffix():
 def test_normalize_idempotent():
     """_normalize must be idempotent — applying it twice gives the same result."""
     from tools.visa import _normalize
+
     assert _normalize("google") == "google"
 
 
 # ---------------------------------------------------------------------------
 # T-09 — check_visa_sponsorship integration tests (mocked index)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.contract
 def test_known_company_match():

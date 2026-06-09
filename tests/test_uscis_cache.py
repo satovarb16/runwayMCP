@@ -26,7 +26,9 @@ def test_first_call_downloads(tmp_path, monkeypatch):
     mock_response.content = _MINIMAL_CSV.encode("utf-8")
     mock_response.raise_for_status = MagicMock()
 
-    with patch("tools.uscis_cache.requests.get", return_value=mock_response) as mock_get:
+    with patch(
+        "tools.uscis_cache.requests.get", return_value=mock_response
+    ) as mock_get:
         result = get_employer_index()
 
     mock_get.assert_called_once()
@@ -50,7 +52,9 @@ def test_second_call_no_http(tmp_path, monkeypatch):
     mock_response.content = _MINIMAL_CSV.encode("utf-8")
     mock_response.raise_for_status = MagicMock()
 
-    with patch("tools.uscis_cache.requests.get", return_value=mock_response) as mock_get:
+    with patch(
+        "tools.uscis_cache.requests.get", return_value=mock_response
+    ) as mock_get:
         get_employer_index()
         get_employer_index()
 
