@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "runway-mcp": {
+      "command": "python",
+      "args": ["-m", "server"]
+    }
+  }
+}

@@ -1,9 +1,1 @@
-{
-  "mcpServers": {
-    "runway-mcp": {
-      "command": "python",
-      "args": ["-m", "server"],
-      "cwd": "/path/to/runwayMCP"
-    }
-  }
-}
+{}
