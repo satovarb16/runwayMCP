@@ -13,7 +13,6 @@ from tools.jobs import (
     _fetch_greenhouse,
     _match_host,
     _extract_gh_token_from_html,
-    _fetch_greenhouse_custom_domain,
 )
 
 
