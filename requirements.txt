@@ -1,5 +1,0 @@
-mcp>=1.2,<2
-pydantic>=2
-requests
-beautifulsoup4
-rapidfuzz
