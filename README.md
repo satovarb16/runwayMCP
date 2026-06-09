@@ -50,7 +50,18 @@ Fetches and parses a job posting from a URL.
 
 Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
 
-Supports Ashby (`jobs.ashbyhq.com`) and Greenhouse (`boards.greenhouse.io`, `job-boards.greenhouse.io`). The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
+The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
+
+**Supported job boards**
+
+| Board | Status | Hosts |
+|-------|--------|-------|
+| Ashby | ✅ Supported | `jobs.ashbyhq.com` |
+| Greenhouse | ✅ Supported | `boards.greenhouse.io`, `job-boards.greenhouse.io` |
+| LinkedIn | 🔜 Coming soon | `linkedin.com/jobs` |
+| Lever | 🔜 Coming soon | `jobs.lever.co` |
+| Workday | 🔜 Coming soon | `*.myworkdayjobs.com` |
+| Rippling | 🔜 Coming soon | `app.rippling.com/jobs` |
 
 ## Setup
 
