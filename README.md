@@ -25,7 +25,7 @@ The visa check only runs for US roles — Claude skips it for positions in other
 | Tool | Status |
 |------|--------|
 | `check_visa_sponsorship` | ✅ Working — real USCIS data |
-| `fetch_job_posting` | 🚧 Stub — returns placeholder data |
+| `fetch_job_posting` | ✅ Working — Ashby and Greenhouse |
 
 ## Tools
 
@@ -50,7 +50,7 @@ Fetches and parses a job posting from a URL.
 
 Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
 
-> **Stub** — currently returns placeholder data. Real scraping (Ashby, Greenhouse, LinkedIn) is a planned next change. The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
+Supports Ashby (`jobs.ashbyhq.com`) and Greenhouse (`boards.greenhouse.io`, `job-boards.greenhouse.io`). The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
 
 ## Setup
 
@@ -113,4 +113,4 @@ pytest                  # full suite (27 tests)
 
 ## Contributing
 
-The most useful next change is implementing real scraping in `fetch_job_posting` — Ashby and Greenhouse have predictable HTML structures. PRs welcome.
+Next useful changes: LinkedIn support in `fetch_job_posting`, and additional job boards. PRs welcome.
