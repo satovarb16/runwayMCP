@@ -106,9 +106,9 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ## Tests
 
 ```bash
-pytest -m contract      # fast contract tests (24 tests)
-pytest -m integration   # server tool registration (1 test)
-pytest                  # full suite (27 tests)
+pytest -m contract      # fast contract tests
+pytest -m integration   # server tool registration
+pytest                  # full suite (50 tests)
 ```
 
 ## Contributing
