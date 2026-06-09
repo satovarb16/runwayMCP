@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from requests.exceptions import RequestException
@@ -204,6 +205,47 @@ def _fetch_greenhouse(url: str) -> JobPostingResult:
 
 
 # ---------------------------------------------------------------------------
+# Greenhouse custom-domain helper
+# ---------------------------------------------------------------------------
+
+
+def _extract_gh_token_from_html(html: str) -> str | None:
+    """Extract the Greenhouse board token from an embedded Greenhouse job page.
+
+    Greenhouse injects a script tag of the form:
+      <script src="https://boards.greenhouse.io/embed/job_board/js?for=TOKEN">
+    """
+    match = re.search(r"greenhouse\.io/embed/job_board/js\?for=([^\"&\s]+)", html)
+    return match.group(1) if match else None
+
+
+def _fetch_greenhouse_custom_domain(url: str) -> JobPostingResult:
+    """Fetch a Greenhouse job posted on a company's custom domain.
+
+    Detects the board token from the embedded Greenhouse script tag, then
+    delegates to _fetch_greenhouse with the canonical boards.greenhouse.io URL.
+    """
+    params = parse_qs(urlparse(url).query)
+    job_id = params["gh_jid"][0]
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        html = response.text
+    except RequestException as e:
+        raise ValueError(f"Failed to fetch job posting: {url}: {e}") from e
+
+    token = _extract_gh_token_from_html(html)
+    if token is None:
+        raise ValueError(
+            f"Failed to fetch job posting: {url}: could not find Greenhouse board token"
+        )
+
+    canonical = f"https://boards.greenhouse.io/{token}/jobs/{job_id}"
+    return _fetch_greenhouse(canonical)
+
+
+# ---------------------------------------------------------------------------
 # Stub (for example.com contract tests)
 # ---------------------------------------------------------------------------
 
@@ -231,17 +273,23 @@ def _stub_result(url: str) -> JobPostingResult:
 # ---------------------------------------------------------------------------
 
 
-def _route(url: str) -> Callable:
-    """Dispatch to the correct parser based on URL hostname."""
-    host = urlparse(url).hostname or ""
-
+def _match_host(host: str) -> Callable | None:
+    """Return the parser for a known job board hostname, or None if unsupported."""
     if "ashbyhq" in host:
         return _fetch_ashby
     if "greenhouse.io" in host:
         return _fetch_greenhouse
     if "example.com" in host:
         return _stub_result
+    return None
 
+
+def _route(url: str) -> Callable:
+    """Dispatch to the correct parser based on URL hostname."""
+    host = urlparse(url).hostname or ""
+    parser = _match_host(host)
+    if parser is not None:
+        return parser
     raise ValueError(f"Unsupported job board: {host}")
 
 
@@ -252,4 +300,23 @@ def _route(url: str) -> Callable:
 
 def fetch_job_posting(url: str) -> JobPostingResult:
     """Fetch and parse a job posting from a supported job board URL."""
-    return _route(url)(url)
+    host = urlparse(url).hostname or ""
+    parser = _match_host(host)
+
+    if parser is None:
+        # Greenhouse custom domain: gh_jid in query params signals a Greenhouse embed
+        if "gh_jid" in parse_qs(urlparse(url).query):
+            return _fetch_greenhouse_custom_domain(url)
+
+        # Unknown host — follow HTTP redirects to discover the canonical job board URL
+        try:
+            response = requests.head(url, timeout=10, allow_redirects=True)
+            resolved_url = response.url
+            parser = _match_host(urlparse(resolved_url).hostname or "")
+            if parser is None:
+                raise ValueError(f"Unsupported job board: {host}")
+            url = resolved_url
+        except RequestException as e:
+            raise ValueError(f"Unsupported job board: {host}") from e
+
+    return parser(url)

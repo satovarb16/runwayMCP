@@ -11,6 +11,9 @@ from tools.jobs import (
     _route,
     _fetch_ashby,
     _fetch_greenhouse,
+    _match_host,
+    _extract_gh_token_from_html,
+    _fetch_greenhouse_custom_domain,
 )
 
 
@@ -153,6 +156,55 @@ def test_route_greenhouse_job_boards():
 def test_route_unsupported_raises():
     with pytest.raises(ValueError, match="Unsupported job board"):
         _route("https://lever.co/company/job-123")
+
+
+def test_match_host_known():
+    assert _match_host("jobs.ashbyhq.com") is _fetch_ashby
+    assert _match_host("boards.greenhouse.io") is _fetch_greenhouse
+
+
+def test_match_host_unknown_returns_none():
+    assert _match_host("lever.co") is None
+    assert _match_host("") is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: fetch_job_posting — redirect following for custom domains
+# ---------------------------------------------------------------------------
+
+CUSTOM_DOMAIN_URL = "https://careers.custom-company.com/jobs/999"
+
+
+@responses_lib.activate
+def test_fetch_job_posting_follows_redirect_to_greenhouse():
+    responses_lib.add(
+        responses_lib.HEAD,
+        CUSTOM_DOMAIN_URL,
+        status=301,
+        headers={"Location": GH_JOB_URL_BOARDS},
+    )
+    responses_lib.add(responses_lib.HEAD, GH_JOB_URL_BOARDS, status=200)
+    responses_lib.add(responses_lib.GET, GH_JOB_API, json=GH_JOB_PAYLOAD_US, status=200)
+    responses_lib.add(responses_lib.GET, GH_META_API, json=GH_META_PAYLOAD, status=200)
+
+    result = fetch_job_posting(CUSTOM_DOMAIN_URL)
+    assert result.title == "Staff Engineer"
+    assert result.company == "Acme Corp"
+    assert result.country == "USA"
+
+
+@responses_lib.activate
+def test_fetch_job_posting_redirect_to_unsupported_raises():
+    responses_lib.add(
+        responses_lib.HEAD,
+        CUSTOM_DOMAIN_URL,
+        status=301,
+        headers={"Location": "https://lever.co/company/job-123"},
+    )
+    responses_lib.add(responses_lib.HEAD, "https://lever.co/company/job-123", status=200)
+
+    with pytest.raises(ValueError, match="Unsupported job board"):
+        fetch_job_posting(CUSTOM_DOMAIN_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +394,89 @@ def test_greenhouse_job_404_raises_value_error():
     responses_lib.add(responses_lib.GET, GH_JOB_API, status=404)
     with pytest.raises(ValueError, match="Failed to fetch job posting"):
         _fetch_greenhouse(GH_JOB_URL_BOARDS)
+
+
+# ---------------------------------------------------------------------------
+# Unit: _extract_gh_token_from_html
+# ---------------------------------------------------------------------------
+
+GH_EMBED_HTML = """
+<html><head>
+<script src="https://boards.greenhouse.io/embed/job_board/js?for=toyotaconnected"></script>
+</head></html>
+"""
+
+GH_EMBED_HTML_JOB_BOARDS = """
+<html><head>
+<script src="https://job-boards.greenhouse.io/embed/job_board/js?for=acme-corp"></script>
+</head></html>
+"""
+
+
+def test_extract_gh_token_boards_domain():
+    assert _extract_gh_token_from_html(GH_EMBED_HTML) == "toyotaconnected"
+
+
+def test_extract_gh_token_job_boards_domain():
+    assert _extract_gh_token_from_html(GH_EMBED_HTML_JOB_BOARDS) == "acme-corp"
+
+
+def test_extract_gh_token_not_found_returns_none():
+    assert _extract_gh_token_from_html("<html><body>no greenhouse here</body></html>") is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: Greenhouse custom domain via gh_jid query param
+# ---------------------------------------------------------------------------
+
+CUSTOM_GH_DOMAIN_URL = "https://www.toyotaconnected.com/job?gh_jid=8577877002"
+CUSTOM_GH_TOKEN = "toyotaconnected"
+CUSTOM_GH_JOB_ID = "8577877002"
+CUSTOM_GH_JOB_API = (
+    f"https://boards-api.greenhouse.io/v1/boards/{CUSTOM_GH_TOKEN}/jobs/{CUSTOM_GH_JOB_ID}?content=true"
+)
+CUSTOM_GH_META_API = f"https://boards-api.greenhouse.io/v1/boards/{CUSTOM_GH_TOKEN}"
+
+
+@responses_lib.activate
+def test_fetch_job_posting_greenhouse_custom_domain_gh_jid():
+    responses_lib.add(
+        responses_lib.GET,
+        CUSTOM_GH_DOMAIN_URL,
+        body=GH_EMBED_HTML,
+        status=200,
+    )
+    responses_lib.add(
+        responses_lib.GET,
+        CUSTOM_GH_JOB_API,
+        json={
+            "title": "Software Engineer, Entry Level",
+            "content": "<p>Build things.</p>",
+            "location": {"name": "Plano, TX, United States"},
+            "first_published": "2026-06-01T00:00:00Z",
+        },
+        status=200,
+    )
+    responses_lib.add(
+        responses_lib.GET,
+        CUSTOM_GH_META_API,
+        json={"name": "Toyota Connected North America"},
+        status=200,
+    )
+
+    result = fetch_job_posting(CUSTOM_GH_DOMAIN_URL)
+    assert result.title == "Software Engineer, Entry Level"
+    assert result.company == "Toyota Connected North America"
+    assert result.country == "USA"
+
+
+@responses_lib.activate
+def test_fetch_job_posting_greenhouse_custom_domain_missing_token_raises():
+    responses_lib.add(
+        responses_lib.GET,
+        CUSTOM_GH_DOMAIN_URL,
+        body="<html><body>no greenhouse embed</body></html>",
+        status=200,
+    )
+    with pytest.raises(ValueError, match="Failed to fetch job posting"):
+        fetch_job_posting(CUSTOM_GH_DOMAIN_URL)
