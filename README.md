@@ -59,9 +59,9 @@ The `country` field in the output is what Claude uses to decide whether to call 
 | Ashby | ✅ Supported | `jobs.ashbyhq.com` |
 | Greenhouse | ✅ Supported | `boards.greenhouse.io`, `job-boards.greenhouse.io` |
 | LinkedIn | 🔜 Coming soon | `linkedin.com/jobs` |
-| Lever | 🔜 Coming soon | `jobs.lever.co` |
-| Workday | 🔜 Coming soon | `*.myworkdayjobs.com` |
-| Rippling | 🔜 Coming soon | `app.rippling.com/jobs` |
+| Lever | ⬜ Not yet | `jobs.lever.co` |
+| Workday | ⬜ Not yet | `*.myworkdayjobs.com` |
+| Rippling | ⬜ Not yet | `app.rippling.com/jobs` |
 
 ## Setup
 
