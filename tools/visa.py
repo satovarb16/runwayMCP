@@ -67,7 +67,9 @@ def check_visa_sponsorship(company: str) -> VisaResult:
         )
 
     norm = _normalize(company)
-    match = fuzz_process.extractOne(norm, index.keys(), scorer=fuzz.token_set_ratio, score_cutoff=85)
+    match = fuzz_process.extractOne(
+        norm, index.keys(), scorer=fuzz.token_set_ratio, score_cutoff=85
+    )
     if match is None:
         return VisaResult(
             company=company,
