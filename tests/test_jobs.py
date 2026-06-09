@@ -200,7 +200,9 @@ def test_fetch_job_posting_redirect_to_unsupported_raises():
         status=301,
         headers={"Location": "https://lever.co/company/job-123"},
     )
-    responses_lib.add(responses_lib.HEAD, "https://lever.co/company/job-123", status=200)
+    responses_lib.add(
+        responses_lib.HEAD, "https://lever.co/company/job-123", status=200
+    )
 
     with pytest.raises(ValueError, match="Unsupported job board"):
         fetch_job_posting(CUSTOM_DOMAIN_URL)
@@ -421,7 +423,10 @@ def test_extract_gh_token_job_boards_domain():
 
 
 def test_extract_gh_token_not_found_returns_none():
-    assert _extract_gh_token_from_html("<html><body>no greenhouse here</body></html>") is None
+    assert (
+        _extract_gh_token_from_html("<html><body>no greenhouse here</body></html>")
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +436,7 @@ def test_extract_gh_token_not_found_returns_none():
 CUSTOM_GH_DOMAIN_URL = "https://www.toyotaconnected.com/job?gh_jid=8577877002"
 CUSTOM_GH_TOKEN = "toyotaconnected"
 CUSTOM_GH_JOB_ID = "8577877002"
-CUSTOM_GH_JOB_API = (
-    f"https://boards-api.greenhouse.io/v1/boards/{CUSTOM_GH_TOKEN}/jobs/{CUSTOM_GH_JOB_ID}?content=true"
-)
+CUSTOM_GH_JOB_API = f"https://boards-api.greenhouse.io/v1/boards/{CUSTOM_GH_TOKEN}/jobs/{CUSTOM_GH_JOB_ID}?content=true"
 CUSTOM_GH_META_API = f"https://boards-api.greenhouse.io/v1/boards/{CUSTOM_GH_TOKEN}"
 
 
