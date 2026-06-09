@@ -171,11 +171,7 @@ ASHBY_HAPPY_PAYLOAD = {
             "location": "San Francisco, CA",
             "descriptionPlain": "Build cool things.",
             "publishedAt": "2026-06-01T00:00:00Z",
-            "address": {
-                "postalAddress": {
-                    "addressCountry": "US"
-                }
-            },
+            "address": {"postalAddress": {"addressCountry": "US"}},
         }
     ]
 }
@@ -209,11 +205,7 @@ ASHBY_NO_COUNTRY_PAYLOAD = {
             "location": "San Francisco, CA",
             "descriptionPlain": "Build UIs.",
             "publishedAt": "2026-06-01T00:00:00Z",
-            "address": {
-                "postalAddress": {
-                    "addressCountry": ""
-                }
-            },
+            "address": {"postalAddress": {"addressCountry": ""}},
         }
     ]
 }
@@ -318,7 +310,9 @@ GH_JOB_PAYLOAD_REMOTE = {
 
 @responses_lib.activate
 def test_greenhouse_remote_country():
-    responses_lib.add(responses_lib.GET, GH_JOB_API, json=GH_JOB_PAYLOAD_REMOTE, status=200)
+    responses_lib.add(
+        responses_lib.GET, GH_JOB_API, json=GH_JOB_PAYLOAD_REMOTE, status=200
+    )
     responses_lib.add(responses_lib.GET, GH_META_API, json=GH_META_PAYLOAD, status=200)
     result = _fetch_greenhouse(GH_JOB_URL_BOARDS)
     assert result.country == "Remote"
