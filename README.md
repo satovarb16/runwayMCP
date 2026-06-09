@@ -1,23 +1,48 @@
 # runwayMCP
 
-MCP server for job search automation. Exposes two tools to Claude Code; reasoning stays in the model.
+An MCP server that gives Claude Code real data for job search decisions.
+
+When you paste a job posting URL into Claude Code, it can automatically check whether the company has a history of H-1B sponsorship — so you know before you spend hours on an application.
+
+Built for job seekers who need visa sponsorship for US roles.
+
+## How it works
+
+Claude Code launches this server over stdio and calls its tools when relevant. You don't invoke the tools directly — Claude decides when to call them based on the conversation.
+
+```
+You: "Evaluate this role for me: https://jobs.example.com/swe-123"
+Claude:
+  1. fetch_job_posting(url)          → job title, company, country, full JD
+  2. check_visa_sponsorship(company) → H-1B history, approval rate, verdict
+  3. [reasons over the data]         → fit analysis, red flags, application advice
+```
+
+The visa check only runs for US roles — Claude skips it for positions in other countries.
+
+## Status
+
+| Tool | Status |
+|------|--------|
+| `check_visa_sponsorship` | ✅ Working — real USCIS data |
+| `fetch_job_posting` | 🚧 Stub — returns placeholder data |
 
 ## Tools
 
 ### `check_visa_sponsorship(company: str) -> VisaResult`
 
-Looks up a company's H-1B sponsorship history via the USCIS H-1B Employer Data Hub.
+Looks up a company's H-1B petition history via the [USCIS H-1B Employer Data Hub](https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub).
 
 Pass the full employer name as it appears in the job posting (e.g. `"Google LLC"`, `"Microsoft Corporation"`). Abbreviated names may match subsidiaries.
 
 Returns: `company`, `total_filings`, `approval_rate` (0–1), `verdict` (green/yellow/red), `source`.
 
-**Verdict thresholds** (calibrated against FY2026 data):
-- `green` — ≥ 5 filings AND approval rate ≥ 80% (top ~10% of sponsors)
-- `yellow` — ≥ 1 filing AND approval rate ≥ 50%
+**Verdict thresholds** (calibrated against FY2026 data, ~36k employers):
+- `green` — ≥ 5 filings AND approval rate ≥ 80% (active sponsor, top ~10%)
+- `yellow` — ≥ 1 filing AND approval rate ≥ 50% (has sponsored before)
 - `red` — no record or rate below threshold
 
-Data is cached locally at `~/.cache/runway-mcp/uscis_h1b.csv` on first call. Only call this tool for roles in the USA.
+Data is downloaded and cached at `~/.cache/runway-mcp/uscis_h1b.csv` on first call (~2MB).
 
 ### `fetch_job_posting(url: str) -> JobPostingResult`
 
@@ -25,24 +50,39 @@ Fetches and parses a job posting from a URL.
 
 Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
 
-The `country` field drives Claude's decision on whether to call `check_visa_sponsorship` — only relevant for US roles.
-
-> Currently a stub. Real scraping is a future change.
-
-## Tool vs. reasoning boundary
-
-These tools only **shape data**. Claude decides:
-- Whether to call `check_visa_sponsorship` (only for US roles)
-- How to interpret the verdict and filing volume
-- Whether a role is a good fit given the full context
+> **Stub** — currently returns placeholder data. Real scraping (Ashby, Greenhouse, LinkedIn) is a planned next change. The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
 
 ## Setup
 
+### 1. Clone and install
+
 ```bash
+git clone https://github.com/satovarb16/runwayMCP
+cd runwayMCP
 pip install -e ".[dev]"
 ```
 
-Claude Code reads `.claude/settings.json` to launch the server automatically over stdio.
+### 2. Configure Claude Code
+
+Add to your Claude Code `settings.json` (`.claude/settings.json` in the project, or `~/.claude/settings.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "runway-mcp": {
+      "command": "python",
+      "args": ["-m", "server"],
+      "cwd": "/absolute/path/to/runwayMCP"
+    }
+  }
+}
+```
+
+Replace the `cwd` with your actual path. On Windows use double backslashes: `"C:\\Users\\you\\runwayMCP"`.
+
+### 3. Use it
+
+Open Claude Code and ask it to evaluate a job posting. On first call, the server downloads the USCIS dataset (~2MB) to `~/.cache/runway-mcp/`.
 
 ## Updating USCIS data
 
@@ -54,6 +94,15 @@ The server downloads FY2023 data automatically on first run. For newer data:
 
 The parser auto-detects encoding and column format across fiscal year versions.
 
+## Tool vs. reasoning boundary
+
+These tools only **fetch and shape data**. Claude handles all reasoning:
+- Whether to call `check_visa_sponsorship` (only for US roles)
+- How to interpret the verdict in context
+- Whether the role is a good fit overall
+
+This is intentional — tools that encode judgment make Claude less useful, not more.
+
 ## Tests
 
 ```bash
@@ -61,3 +110,7 @@ pytest -m contract      # fast contract tests (24 tests)
 pytest -m integration   # server tool registration (1 test)
 pytest                  # full suite (27 tests)
 ```
+
+## Contributing
+
+The most useful next change is implementing real scraping in `fetch_job_posting` — Ashby and Greenhouse have predictable HTML structures. PRs welcome.
