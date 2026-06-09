@@ -3,7 +3,7 @@
     "runway-mcp": {
       "command": "python",
       "args": ["-m", "server"],
-      "cwd": "C:\\Users\\satov\\runwayMCP"
+      "cwd": "/path/to/runwayMCP"
     }
   }
 }
