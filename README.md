@@ -50,7 +50,18 @@ Fetches and parses a job posting from a URL.
 
 Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
 
-Supports Ashby (`jobs.ashbyhq.com`) and Greenhouse (`boards.greenhouse.io`, `job-boards.greenhouse.io`). The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
+The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
+
+**Supported job boards**
+
+| Board | Status | Hosts |
+|-------|--------|-------|
+| Ashby | ✅ Supported | `jobs.ashbyhq.com` |
+| Greenhouse | ✅ Supported | `boards.greenhouse.io`, `job-boards.greenhouse.io` |
+| LinkedIn | 🔜 Coming soon | `linkedin.com/jobs` |
+| Lever | ⬜ Not yet | `jobs.lever.co` |
+| Workday | ⬜ Not yet | `*.myworkdayjobs.com` |
+| Rippling | ⬜ Not yet | `app.rippling.com/jobs` |
 
 ## Setup
 
@@ -106,9 +117,9 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ## Tests
 
 ```bash
-pytest -m contract      # fast contract tests (24 tests)
-pytest -m integration   # server tool registration (1 test)
-pytest                  # full suite (27 tests)
+pytest -m contract      # fast contract tests
+pytest -m integration   # server tool registration
+pytest                  # full suite (50 tests)
 ```
 
 ## Contributing
