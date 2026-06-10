@@ -17,6 +17,12 @@ dev = [
     "pytest-asyncio",
     "responses",
 ]
+browser = [
+    "playwright>=1.40",
+]
+
+[tool.setuptools.packages.find]
+include = ["tools*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
