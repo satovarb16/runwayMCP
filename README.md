@@ -52,16 +52,39 @@ Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`
 
 The `country` field in the output is what Claude uses to decide whether to call `check_visa_sponsorship`.
 
+**How parsing works**
+
+The tool uses a two-tier strategy:
+
+1. **Dedicated parsers** — fast, API-backed, guaranteed results for known ATS platforms (Greenhouse, Ashby, Lever).
+2. **Generic HTML fallback** — for any URL not matched by a dedicated parser, the tool attempts standards-based extraction in order: JSON-LD (`schema.org/JobPosting`) → HTML microdata (`itemprop`) → `__NEXT_DATA__` (Next.js SSR payload). If all static extractors fail and the `[browser]` extra is installed, it renders the page with a headless Chromium and retries the cascade. Bot-challenge pages (Cloudflare, Incapsula) are detected early and fail fast with a clear error.
+
+This means many boards beyond the table below work out of the box — anything that embeds `schema.org/JobPosting` markup (Workday, ADP, many custom career pages) will extract successfully via the generic path.
+
 **Supported job boards**
 
-| Board | Status | Hosts |
-|-------|--------|-------|
-| Ashby | ✅ Supported | `jobs.ashbyhq.com` |
-| Greenhouse | ✅ Supported | `boards.greenhouse.io`, `job-boards.greenhouse.io` |
-| LinkedIn | 🔜 Coming soon | `linkedin.com/jobs` |
-| Lever | ⬜ Not yet | `jobs.lever.co` |
-| Workday | ⬜ Not yet | `*.myworkdayjobs.com` |
-| Rippling | ⬜ Not yet | `app.rippling.com/jobs` |
+The typical flow: you find a job on LinkedIn/Indeed/Handshake → click Apply → get redirected to the company's ATS page → paste that final URL here. This tool never touches the aggregator — it only needs the destination URL.
+
+| ATS | Canonical domain | Company custom domain | Notes |
+|-----|------------------|-----------------------|-------|
+| Greenhouse | ✅ `boards.greenhouse.io`, `job-boards.greenhouse.io`, `job-boards.eu.greenhouse.io` | ✅ with `[browser]` extra | Custom domains require Playwright — see setup below |
+| Ashby | ✅ `jobs.ashbyhq.com` | ❌ not yet | |
+| Lever | ✅ `jobs.lever.co`, `lever.co` | ❌ not yet | |
+| Any board with `schema.org/JobPosting` markup | ✅ generic fallback | ✅ generic fallback | No guarantees — quality depends on the site's markup |
+| Workday, ADP, Jacobs, others | ⚠️ generic fallback (best-effort) | ⚠️ generic fallback (best-effort) | Works if the page embeds JSON-LD or microdata |
+| SmartRecruiters | ❌ not yet | ❌ not yet | Has public API — dedicated parser planned |
+| BambooHR | ❌ not yet | ❌ not yet | Has public API — dedicated parser planned |
+| iCIMS | ❌ not yet | ❌ not yet | |
+
+**Known gaps**
+
+| Scenario | Behavior | Workaround |
+|----------|----------|------------|
+| Greenhouse custom domain (e.g. `cribl.io/jobs?gh_jid=123`) without Playwright installed | Fails with an actionable error | Install `[browser]` extra |
+| Greenhouse custom domain behind bot protection (Incapsula, Cloudflare) | Fails — bot protection blocks even headless browsers | Use the canonical `boards.greenhouse.io` URL if available |
+| Lever custom domain (e.g. `stripe.com/jobs/uuid`) | Unsupported — Lever token not detectable from HTML | Find the `jobs.lever.co/stripe/uuid` URL directly |
+| Generic fallback page behind bot protection | Fails with a bot-challenge error | No workaround — the site blocks scrapers |
+| Any aggregator URL (LinkedIn, Indeed, Handshake) | Unsupported — these are not ATS pages | Use the URL from the "Apply" redirect instead |
 
 ## Setup
 
@@ -73,7 +96,18 @@ cd runwayMCP
 pip install -e ".[dev]"
 ```
 
-### 2. Configure Claude Code
+### 2. Browser extra (Greenhouse custom domains)
+
+Custom-domain Greenhouse job pages that use a JavaScript SPA (React, Next.js) do not include the board token in static HTML. To handle those, install the optional `browser` extra and the Chromium binary:
+
+```bash
+pip install -e ".[dev,browser]"
+playwright install chromium
+```
+
+Without this extra, custom-domain SPA pages will fail with an actionable error message telling you to install it. Canonical `boards.greenhouse.io` URLs always work without it.
+
+### 3. Configure Claude Code
 
 Add to your Claude Code `settings.json` (`.claude/settings.json` in the project, or `~/.claude/settings.json` globally):
 
@@ -119,9 +153,16 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ```bash
 pytest -m contract      # fast contract tests
 pytest -m integration   # server tool registration
-pytest                  # full suite (50 tests)
+pytest                  # full suite
 ```
 
 ## Contributing
 
-Next useful changes: LinkedIn support in `fetch_job_posting`, and additional job boards. PRs welcome.
+Highest-value next features (in priority order):
+1. **SmartRecruiters** — public API, clean integration
+2. **BambooHR** — public API, clean integration
+3. **Workday** — large employer coverage, needs scraping
+4. **Lever custom domains** — same pattern as Greenhouse custom domains
+5. **Greenhouse/Lever/Ashby custom domains without Playwright** — lighter alternative to headless browser
+
+PRs welcome.
