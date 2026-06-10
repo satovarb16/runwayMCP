@@ -16,13 +16,11 @@ from tools.jobs import (
     _fetch_lever,
     _match_host,
     _extract_gh_token_from_html,
-    _fetch_greenhouse_custom_domain,
     _render_and_extract_gh_token,
     _is_bot_challenge,
     _extract_jsonld,
     _extract_microdata,
     _extract_next_data,
-    _fetch_generic,
 )
 
 
