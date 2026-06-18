@@ -96,7 +96,7 @@ def test_profile_data_full():
 
 
 def test_profile_setup_result_success_shape():
-    from tools.profile import ProfileSetupResult, ProfileData
+    from tools.profile import ProfileSetupResult
 
     result = ProfileSetupResult(
         success=True,
