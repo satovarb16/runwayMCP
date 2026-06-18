@@ -4,29 +4,32 @@ An MCP server that helps international students (F-1/OPT) filter US job postings
 
 ## Quick install
 
+Create a `.mcp.json` file in the directory where you run Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "runway-mcp": {
+      "command": "uvx",
+      "args": ["runway-mcp"]
+    }
+  }
+}
+```
+
+That's it. Open Claude Code — `uvx` downloads and runs the server automatically.
+
+> **Don't have `uv`?** Install it: `pip install uv` (or see [uv docs](https://docs.astral.sh/uv/getting-started/installation/))
+
+### Alternative: install from source
+
 ```bash
 git clone https://github.com/satovarb16/runwayMCP
 cd runwayMCP
 pip install -e ".[dev]"
 ```
 
-Then create a `.mcp.json` file in the directory where you run Claude Code:
-
-```json
-{
-  "mcpServers": {
-    "runway-mcp": {
-      "command": "python",
-      "args": ["-m", "server"],
-      "cwd": "/absolute/path/to/runwayMCP"
-    }
-  }
-}
-```
-
-> On Windows use double backslashes: `"C:\\Users\\you\\runwayMCP"`
-
-That's it. Open Claude Code and start using it.
+Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and add `"cwd": "/path/to/runwayMCP"`.
 
 ## First-time setup: ingest your CV
 

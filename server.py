@@ -40,5 +40,10 @@ mcp.tool()(analyze_job)
 _warn_if_playwright_missing()
 refresh_to_latest_fy()
 
-if __name__ == "__main__":
+
+def main() -> None:
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

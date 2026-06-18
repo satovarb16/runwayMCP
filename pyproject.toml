@@ -11,6 +11,9 @@ dependencies = [
     "rapidfuzz",
 ]
 
+[project.scripts]
+runway-mcp = "server:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
@@ -22,6 +25,9 @@ dev = [
 browser = [
     "playwright>=1.40",
 ]
+
+[tool.setuptools]
+py-modules = ["server"]
 
 [tool.setuptools.packages.find]
 include = ["tools*"]
