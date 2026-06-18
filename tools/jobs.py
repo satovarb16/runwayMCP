@@ -80,10 +80,26 @@ def _normalize_country(token: str) -> str:
     return normalized
 
 
+# Two-letter US state codes — used by _country_from_freetext to map city/state
+# location strings (e.g. "San Francisco, CA") to "USA".
+_US_STATE_CODES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+}
+
+
 def _country_from_freetext(text: str | None) -> str | None:
     """Extract and normalize country from a free-text location string.
 
-    Splits on comma and uses the last token.
+    Splits on comma and uses the last token. Recognises two-letter US state
+    codes (e.g. "CA", "NY") as "USA" so that city/state formats like
+    "San Francisco, CA" produce the correct country rather than a raw state
+    abbreviation.
+
     Returns None if text is empty or None.
     """
     if not text:
@@ -94,6 +110,8 @@ def _country_from_freetext(text: str | None) -> str | None:
     last = parts[-1].strip()
     if not last:
         return None
+    if last.upper() in _US_STATE_CODES:
+        return "USA"
     return _normalize_country(last)
 
 
@@ -359,12 +377,8 @@ def _fetch_ashby(url: str) -> JobPostingResult:
 
     if address_country:
         country = _normalize_country(address_country)
-    elif location:
-        # Last whitespace-delimited token of the location string
-        tokens = location.split()
-        country = tokens[-1] if tokens else None
     else:
-        country = None
+        country = _country_from_freetext(location)
 
     return JobPostingResult(
         title=title,
@@ -617,18 +631,7 @@ def _match_host(host: str) -> Callable | None:
         return _fetch_greenhouse
     if "lever.co" in host:
         return _fetch_lever
-    if "example.com" in host:
-        return _stub_result
     return None
-
-
-def _route(url: str) -> Callable:
-    """Dispatch to the correct parser based on URL hostname."""
-    host = urlparse(url).hostname or ""
-    parser = _match_host(host)
-    if parser is not None:
-        return parser
-    raise ValueError(f"Unsupported job board: {host}")
 
 
 # ---------------------------------------------------------------------------

@@ -4,12 +4,15 @@ from pathlib import Path
 
 from tools._utils import normalize_company
 
-# FY2023 is the latest with a known stable direct URL.
+# FY2024 is the latest with a known stable direct URL.
 # For newer data, drop the file at CACHE_PATH manually (downloaded from
 # https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub
 # via Crosstab View → Download CSV).
+# NOTE: Changing CACHE_URL does NOT auto-invalidate an existing on-disk cache.
+# If an older FY CSV is cached at CACHE_PATH (~/.cache/runway-mcp/uscis_h1b.csv),
+# delete it manually before running so the updated FY dataset is downloaded.
 CACHE_URL = (
-    "https://www.uscis.gov/sites/default/files/document/data/h1b_datahubexport-2023.csv"
+    "https://www.uscis.gov/sites/default/files/document/data/h1b_datahubexport-2024.csv"
 )
 CACHE_PATH = Path.home() / ".cache" / "runway-mcp" / "uscis_h1b.csv"
 _INDEX: dict | None = None

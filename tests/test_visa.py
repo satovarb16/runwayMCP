@@ -3,6 +3,7 @@ from unittest.mock import patch
 from pydantic import ValidationError
 
 from tools.visa import VisaResult, Verdict, check_visa_sponsorship
+from tools.uscis_cache import CACHE_URL
 
 
 @pytest.mark.contract
@@ -131,3 +132,33 @@ def test_cache_unavailable():
     assert isinstance(result, VisaResult)
     assert result.verdict == Verdict.RED
     assert "unavailable" in result.source
+
+
+# ---------------------------------------------------------------------------
+# T-10 — USCIS FY alignment: CACHE_URL year matches VisaResult.source label
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.contract
+def test_cache_url_points_to_fy2024():
+    """CACHE_URL must reference the FY2024 USCIS export file."""
+    assert "h1b_datahubexport-2024.csv" in CACHE_URL
+
+
+@pytest.mark.contract
+def test_visa_result_source_default_matches_fy2024():
+    """VisaResult.source default must equal 'USCIS H-1B Employer Hub FY2024'."""
+    assert VisaResult.model_fields["source"].default == "USCIS H-1B Employer Hub FY2024"
+
+
+@pytest.mark.contract
+def test_source_label_matches_cache_url_year():
+    """The FY year in CACHE_URL must match the FY year in VisaResult.source default."""
+    import re
+    url_match = re.search(r"datahubexport-(\d{4})\.csv", CACHE_URL)
+    source_match = re.search(r"FY(\d{4})", VisaResult.model_fields["source"].default)
+    assert url_match is not None, "CACHE_URL must contain a 4-digit year"
+    assert source_match is not None, "VisaResult.source default must contain FY<year>"
+    assert url_match.group(1) == source_match.group(1), (
+        f"CACHE_URL year {url_match.group(1)} must match source label year {source_match.group(1)}"
+    )
