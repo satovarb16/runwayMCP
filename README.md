@@ -147,7 +147,7 @@ If Playwright is not installed, the server prints a warning to stderr on startup
 
 ### 3. Configure Claude Code
 
-Add to your Claude Code `settings.json` (`.claude/settings.json` or `~/.claude/settings.json`):
+Create a `.mcp.json` file in your project root (or wherever you run Claude Code from):
 
 ```json
 {
@@ -162,6 +162,8 @@ Add to your Claude Code `settings.json` (`.claude/settings.json` or `~/.claude/s
 ```
 
 Replace `cwd` with your actual path. On Windows use double backslashes: `"C:\\Users\\you\\runwayMCP"`.
+
+> **Note**: `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Code will ask for your approval the first time these tools make a sampling request. This is expected behavior.
 
 ### 4. Ingest your CV
 
