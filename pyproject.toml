@@ -26,6 +26,7 @@ include = ["tools*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 markers = [
     "contract: contract tests that pin the Pydantic output shape",
     "integration: tests that launch or import the full server",

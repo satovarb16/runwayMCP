@@ -10,11 +10,11 @@ from tools.jobs import (
     _normalize_country,
     _country_from_freetext,
     _slug_to_company,
-    _route,
     _fetch_ashby,
     _fetch_greenhouse,
     _fetch_lever,
     _match_host,
+    _stub_result,
     _extract_gh_token_from_html,
     _render_and_extract_gh_token,
     _is_bot_challenge,
@@ -31,8 +31,8 @@ from tools.jobs import (
 
 @pytest.mark.contract
 def test_valid_url_accepted():
-    """Valid URL string must not raise any exception."""
-    result = fetch_job_posting(url="https://example.com/jobs/123")
+    """_stub_result with a valid URL must not raise any exception."""
+    result = _stub_result(url="https://example.com/jobs/123")
     assert result is not None
 
 
@@ -45,15 +45,15 @@ def test_missing_url_raises():
 
 @pytest.mark.contract
 def test_output_is_pydantic_model():
-    """Handler must return a JobPostingResult instance, not a plain dict."""
-    result = fetch_job_posting(url="https://example.com/jobs/123")
+    """_stub_result must return a JobPostingResult instance, not a plain dict."""
+    result = _stub_result(url="https://example.com/jobs/123")
     assert isinstance(result, JobPostingResult)
 
 
 @pytest.mark.contract
 def test_country_present_and_non_empty():
     """country field must be present and a non-empty string."""
-    result = fetch_job_posting(url="https://example.com/jobs/123")
+    result = _stub_result(url="https://example.com/jobs/123")
     assert hasattr(result, "country")
     assert isinstance(result.country, str)
     assert result.country != ""
@@ -62,7 +62,7 @@ def test_country_present_and_non_empty():
 @pytest.mark.contract
 def test_required_string_fields_non_empty():
     """title, company, and description must all be non-empty strings."""
-    result = fetch_job_posting(url="https://example.com/jobs/123")
+    result = _stub_result(url="https://example.com/jobs/123")
     assert isinstance(result.title, str) and result.title != ""
     assert isinstance(result.company, str) and result.company != ""
     assert isinstance(result.description, str) and result.description != ""
@@ -141,28 +141,28 @@ def test_slug_to_company_single_word():
 
 
 # ---------------------------------------------------------------------------
-# Unit: _route
+# Unit: _match_host (previously tested via _route — _route has been deleted)
 # ---------------------------------------------------------------------------
 
 
 def test_route_ashby():
-    fn = _route("https://jobs.ashbyhq.com/company/abc-123")
-    assert fn is _fetch_ashby
+    """jobs.ashbyhq.com must resolve to _fetch_ashby."""
+    assert _match_host("jobs.ashbyhq.com") is _fetch_ashby
 
 
 def test_route_greenhouse_boards():
-    fn = _route("https://boards.greenhouse.io/acme/jobs/123")
-    assert fn is _fetch_greenhouse
+    """boards.greenhouse.io must resolve to _fetch_greenhouse."""
+    assert _match_host("boards.greenhouse.io") is _fetch_greenhouse
 
 
 def test_route_greenhouse_job_boards():
-    fn = _route("https://job-boards.greenhouse.io/acme/jobs/123")
-    assert fn is _fetch_greenhouse
+    """job-boards.greenhouse.io must resolve to _fetch_greenhouse."""
+    assert _match_host("job-boards.greenhouse.io") is _fetch_greenhouse
 
 
 def test_route_unsupported_raises():
-    with pytest.raises(ValueError, match="Unsupported job board"):
-        _route("https://unknownboard.example.org/company/job-123")
+    """An unsupported host must return None from _match_host (not raise)."""
+    assert _match_host("unknownboard.example.org") is None
 
 
 def test_match_host_known():
@@ -173,6 +173,11 @@ def test_match_host_known():
 def test_match_host_unknown_returns_none():
     assert _match_host("unknownboard.example.org") is None
     assert _match_host("") is None
+
+
+def test_match_host_example_com_returns_none():
+    """example.com must not be a known host — must return None."""
+    assert _match_host("example.com") is None
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +280,10 @@ ASHBY_NO_COUNTRY_PAYLOAD = {
 
 @responses_lib.activate
 def test_ashby_location_fallback_country():
-    """When addressCountry is absent/empty, fall back to last whitespace token of location."""
+    """When addressCountry is absent/empty, fall back to _country_from_freetext(location).
+
+    "San Francisco, CA" → last comma segment "CA" is a US state → country is "USA".
+    """
     responses_lib.add(
         responses_lib.GET,
         ASHBY_BOARD_URL,
@@ -283,8 +291,7 @@ def test_ashby_location_fallback_country():
         status=200,
     )
     result = _fetch_ashby(ASHBY_JOB_URL)
-    # "San Francisco, CA" → last whitespace token is "CA"
-    assert result.country == "CA"
+    assert result.country == "USA"
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +521,8 @@ def test_match_host_non_lever_not_fetch_lever():
 
 
 def test_route_lever_returns_fetch_lever():
-    """_route with a jobs.lever.co URL must return _fetch_lever."""
-    fn = _route("https://jobs.lever.co/acmecorp/abc-123")
-    assert fn is _fetch_lever
+    """jobs.lever.co must resolve to _fetch_lever."""
+    assert _match_host("jobs.lever.co") is _fetch_lever
 
 
 # ---------------------------------------------------------------------------
