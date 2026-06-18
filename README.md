@@ -1,10 +1,68 @@
 # runwayMCP
 
-An MCP server that gives Claude Code real data for job search decisions.
+An MCP server that helps international students (F-1/OPT) filter US job postings by technical fit AND visa sponsorship history — in a single call.
 
-Paste a job posting URL into Claude Code and it will automatically fetch the job, check the company's H-1B sponsorship history, and score how well it matches your CV — in a single call.
+## Quick install
 
-Built for international students (F-1/OPT) who need visa sponsorship for US roles.
+```bash
+git clone https://github.com/satovarb16/runwayMCP
+cd runwayMCP
+pip install -e ".[dev]"
+```
+
+Then create a `.mcp.json` file in the directory where you run Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "runway-mcp": {
+      "command": "python",
+      "args": ["-m", "server"],
+      "cwd": "/absolute/path/to/runwayMCP"
+    }
+  }
+}
+```
+
+> On Windows use double backslashes: `"C:\\Users\\you\\runwayMCP"`
+
+That's it. Open Claude Code and start using it.
+
+## First-time setup: ingest your CV
+
+Before scoring job matches, store your CV once:
+
+```
+You: "Set up my profile using my CV at /path/to/resume.pdf"
+```
+
+Supports `.pdf` and `.docx`. Claude will ask for sampling approval — this is expected.
+
+## Usage
+
+```
+You: "Evaluate this role for me: https://jobs.example.com/swe-123"
+Claude:
+  → analyze_job(url) — fetches job + checks visa + scores CV match
+  → Returns APPLY / CONSIDER / SKIP + reasoning
+```
+
+On first run, the server downloads USCIS H-1B data (~2MB) automatically.
+
+## Optional: Playwright for JavaScript-heavy job boards
+
+Some Greenhouse custom domains require a headless browser to parse. Install the optional extra:
+
+```bash
+pip install -e ".[dev,browser]"
+playwright install chromium
+```
+
+Without it, canonical `boards.greenhouse.io` URLs always work. The server warns you at startup if Playwright is missing.
+
+> **Note**: `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Code will ask for your approval the first time these tools make a sampling request. This is expected behavior.
+
+---
 
 ## How it works
 
@@ -35,7 +93,7 @@ The visa check only runs for US roles — Claude skips it for positions in other
 | Tool | Status |
 |------|--------|
 | `fetch_job_posting` | ✅ Working — Greenhouse, Ashby, Lever, generic fallback |
-| `check_visa_sponsorship` | ✅ Working — real USCIS FY2024 data |
+| `check_visa_sponsorship` | ✅ Working — real USCIS FY2024 data, auto-refreshes on startup |
 | `setup_profile` | ✅ Working — CV ingestion via MCP Sampling |
 | `update_profile` | ✅ Working — update stored CV |
 | `analyze_match` | ✅ Working — job-vs-CV scoring |
@@ -79,8 +137,6 @@ Scores a job posting against your stored CV using Claude. Returns a 0–100 scor
 
 Looks up a company's H-1B petition history via the [USCIS H-1B Employer Data Hub](https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub).
 
-Pass the full employer name as it appears in the job posting (e.g. `"Google LLC"`, `"Microsoft Corporation"`). Abbreviated names may match subsidiaries.
-
 Returns: `company`, `total_filings`, `approval_rate` (0–1), `verdict` (green/yellow/red), `source`.
 
 **Verdict thresholds** (calibrated against FY2024 data, ~36k employers):
@@ -88,20 +144,13 @@ Returns: `company`, `total_filings`, `approval_rate` (0–1), `verdict` (green/y
 - `yellow` — ≥ 1 filing AND approval rate ≥ 50% (has sponsored before)
 - `red` — no record or rate below threshold
 
-Data is downloaded and cached at `~/.cache/runway-mcp/uscis_h1b.csv` on first call (~2MB).
+Data is downloaded and cached at `~/.cache/runway-mcp/uscis_h1b.csv` on first call (~2MB) and auto-refreshes to the latest FY on every server startup.
 
 ### `fetch_job_posting(url: str) -> JobPostingResult`
 
 Fetches and parses a job posting from a URL.
 
 Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
-
-The `country` field is what Claude uses to decide whether to call `check_visa_sponsorship`.
-
-**How parsing works**
-
-1. **Dedicated parsers** — fast, API-backed, guaranteed results for known ATS platforms (Greenhouse, Ashby, Lever).
-2. **Generic HTML fallback** — for any other URL, the tool attempts: JSON-LD (`schema.org/JobPosting`) → HTML microdata (`itemprop`) → `__NEXT_DATA__` (Next.js SSR). If all static extractors fail and the `[browser]` extra is installed, it renders with headless Chromium and retries. Bot-challenge pages (Cloudflare, Incapsula) are detected early and fail fast.
 
 **Supported job boards**
 
@@ -124,72 +173,6 @@ The `country` field is what Claude uses to decide whether to call `check_visa_sp
 | Lever custom domain | Unsupported | Find the `jobs.lever.co/company/uuid` URL directly |
 | Any aggregator URL (LinkedIn, Indeed, Handshake) | Unsupported | Use the URL from the "Apply" redirect |
 
-## Setup
-
-### 1. Clone and install
-
-```bash
-git clone https://github.com/satovarb16/runwayMCP
-cd runwayMCP
-pip install -e ".[dev]"
-```
-
-### 2. Browser extra (Greenhouse custom domains)
-
-```bash
-pip install -e ".[dev,browser]"
-playwright install chromium
-```
-
-Without this extra, custom-domain SPA pages will fail with an actionable error. Canonical `boards.greenhouse.io` URLs always work without it.
-
-If Playwright is not installed, the server prints a warning to stderr on startup with install instructions.
-
-### 3. Configure Claude Code
-
-Create a `.mcp.json` file in your project root (or wherever you run Claude Code from):
-
-```json
-{
-  "mcpServers": {
-    "runway-mcp": {
-      "command": "python",
-      "args": ["-m", "server"],
-      "cwd": "/absolute/path/to/runwayMCP"
-    }
-  }
-}
-```
-
-Replace `cwd` with your actual path. On Windows use double backslashes: `"C:\\Users\\you\\runwayMCP"`.
-
-> **Note**: `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Code will ask for your approval the first time these tools make a sampling request. This is expected behavior.
-
-### 4. Ingest your CV
-
-Before using `analyze_job` or `analyze_match`, store your CV:
-
-```
-You: "Set up my profile using my CV at /path/to/resume.pdf"
-Claude: setup_profile("/path/to/resume.pdf")
-```
-
-### 5. Use it
-
-```
-You: "Evaluate this role for me: https://jobs.example.com/swe-123"
-```
-
-On first call, the server downloads the USCIS dataset (~2MB) to `~/.cache/runway-mcp/`.
-
-## Updating USCIS data
-
-The server downloads FY2024 data automatically on first run. For newer data:
-
-1. Go to https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub
-2. Click **Crosstab View** → select fiscal year → **Download to Excel** → CSV
-3. Replace `~/.cache/runway-mcp/uscis_h1b.csv` with the downloaded file
-
 ## Tool vs. reasoning boundary
 
 These tools only **fetch and shape data**. Claude handles all reasoning:
@@ -204,7 +187,7 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ```bash
 pytest -m contract      # fast contract tests
 pytest -m integration   # server tool registration
-pytest                  # full suite (207 tests)
+pytest                  # full suite (214 tests)
 ```
 
 ## Contributing
@@ -215,10 +198,9 @@ pre-commit install       # runs ruff lint + format before every commit
 ```
 
 Highest-value next features (in priority order):
-1. **USCIS auto-refresh** — FY detection at startup, auto-download when new data is available
-2. **Workday parser** — dedicated parser for better reliability on Workday boards
-3. **SmartRecruiters** — public API, clean integration
-4. **BambooHR** — public API, clean integration
-5. **Lever custom domains** — same pattern as Greenhouse custom domains
+1. **Workday parser** — dedicated parser for better reliability on Workday boards
+2. **SmartRecruiters** — public API, clean integration
+3. **BambooHR** — public API, clean integration
+4. **Lever custom domains** — same pattern as Greenhouse custom domains
 
 PRs welcome.
