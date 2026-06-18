@@ -1,0 +1,70 @@
+{
+  "mcpb_version": "0.1",
+  "name": "runway-mcp",
+  "display_name": "runwayMCP",
+  "version": "0.1.0",
+  "description": "Job-fit filter for international students — fetch jobs, check H-1B visa sponsorship, and score CV match in one call.",
+  "long_description": "runwayMCP gives Claude the real data it needs to evaluate job postings for international students (F-1/OPT) seeking US roles.\n\n**What it does in one call (`analyze_job`):**\n- Fetches the job posting from Greenhouse, Ashby, Lever, or any board with schema.org markup\n- Checks the company's H-1B sponsorship history against USCIS data\n- Scores how well the job matches your stored CV (0–100)\n- Returns an `APPLY / CONSIDER / SKIP` recommendation\n\n**Setup:** After installing, tell Claude to set up your profile: *\"Set up my profile using my CV at /path/to/resume.pdf\"*\n\n**Supported job boards:** Greenhouse, Ashby, Lever, and any board that embeds `schema.org/JobPosting` markup (many Workday and ADP pages work via generic fallback).\n\n**Note:** `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Desktop will ask for your approval the first time these tools make a sampling request. This is expected.",
+  "author": {
+    "name": "satovar16",
+    "url": "https://github.com/satovarb16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/satovarb16/runwayMCP"
+  },
+  "support": "https://github.com/satovarb16/runwayMCP/issues",
+  "license": "MIT",
+  "keywords": ["jobs", "visa", "h1b", "international students", "f1", "opt", "career"],
+  "server": {
+    "type": "python",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "python",
+      "args": ["-m", "server"],
+      "platforms": {
+        "win32": {
+          "command": "python"
+        },
+        "darwin": {
+          "command": "python3"
+        },
+        "linux": {
+          "command": "python3"
+        }
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "analyze_job",
+      "description": "One-call orchestrator: fetch job + check H-1B visa sponsorship + score CV match. Returns APPLY/CONSIDER/SKIP recommendation."
+    },
+    {
+      "name": "fetch_job_posting",
+      "description": "Fetch and parse a job posting from a URL (Greenhouse, Ashby, Lever, or generic fallback)."
+    },
+    {
+      "name": "check_visa_sponsorship",
+      "description": "Check a company's H-1B sponsorship history against USCIS data. Returns GREEN/YELLOW/RED verdict."
+    },
+    {
+      "name": "setup_profile",
+      "description": "Ingest a CV file (.pdf or .docx) and store it as a structured profile for job matching."
+    },
+    {
+      "name": "update_profile",
+      "description": "Replace the stored CV profile with a new file."
+    },
+    {
+      "name": "analyze_match",
+      "description": "Score a job posting against the stored CV profile. Returns 0–100 score with matched/missing skills."
+    }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}
