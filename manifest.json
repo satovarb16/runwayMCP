@@ -20,19 +20,8 @@
     "type": "python",
     "entry_point": "server.py",
     "mcp_config": {
-      "command": "python",
-      "args": ["-m", "server"],
-      "platforms": {
-        "win32": {
-          "command": "python"
-        },
-        "darwin": {
-          "command": "python3"
-        },
-        "linux": {
-          "command": "python3"
-        }
-      }
+      "command": "uvx",
+      "args": ["runway-mcp"]
     }
   },
   "tools": [
