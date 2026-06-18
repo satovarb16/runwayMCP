@@ -11,6 +11,7 @@ from tools.analyze import analyze_job
 from tools.jobs import fetch_job_posting
 from tools.match import analyze_match
 from tools.profile import setup_profile, update_profile
+from tools.uscis_cache import refresh_to_latest_fy
 from tools.visa import check_visa_sponsorship
 
 
@@ -37,6 +38,7 @@ mcp.tool()(analyze_match)
 mcp.tool()(analyze_job)
 
 _warn_if_playwright_missing()
+refresh_to_latest_fy()
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

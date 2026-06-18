@@ -1,4 +1,6 @@
 import csv
+import re
+import sys
 import requests
 from pathlib import Path
 
@@ -94,3 +96,55 @@ def get_employer_index() -> dict:
         k: v for k, v in index.items() if v["approvals"] + v["denials"] >= MIN_FILINGS
     }
     return _INDEX
+
+
+def refresh_to_latest_fy() -> None:
+    """Probe USCIS for the next fiscal-year H-1B dataset at startup.
+
+    Never raises. On HTTP 200 overwrites CACHE_PATH and resets the in-memory
+    index; otherwise keeps the existing cache and warns to stderr.
+    """
+    global _INDEX
+    try:
+        match = re.search(r"h1b_datahubexport-(\d{4})\.csv", CACHE_URL)
+        if not match:
+            print(
+                "WARNING: Could not detect FY from CACHE_URL — skipping auto-refresh",
+                file=sys.stderr,
+            )
+            return
+
+        current_fy = int(match.group(1))
+        next_fy = current_fy + 1
+        candidate_url = CACHE_URL.replace(
+            f"h1b_datahubexport-{current_fy}.csv",
+            f"h1b_datahubexport-{next_fy}.csv",
+        )
+
+        try:
+            response = requests.get(candidate_url, timeout=10)
+        except requests.RequestException as exc:
+            print(
+                f"WARNING: Using cached FY{current_fy} USCIS data — "
+                f"could not fetch FY{next_fy} ({exc})",
+                file=sys.stderr,
+            )
+            return
+
+        if response.status_code != 200:
+            print(
+                f"WARNING: Using cached FY{current_fy} USCIS data — "
+                f"FY{next_fy} not available (HTTP {response.status_code})",
+                file=sys.stderr,
+            )
+            return
+
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_PATH.write_bytes(response.content)
+        _INDEX = None
+        print(f"Updated USCIS data to FY{next_fy}", file=sys.stderr)
+    except Exception as exc:  # absolute no-escape guard
+        print(
+            f"WARNING: USCIS FY refresh skipped due to unexpected error ({exc})",
+            file=sys.stderr,
+        )
