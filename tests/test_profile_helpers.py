@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import pytest
-from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +199,6 @@ def test_write_profile_no_partial_file_left_on_failure(tmp_path, monkeypatch):
     dest.write_text('{"name": "Original"}', encoding="utf-8")
 
     # Monkeypatch model_dump_json to raise mid-write
-    original_dump = ProfileData.model_dump_json
-
     def boom(self, **kwargs):
         raise RuntimeError("simulated write failure")
 

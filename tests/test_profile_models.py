@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +98,6 @@ def test_profile_data_full():
 def test_profile_setup_result_success_shape():
     from tools.profile import ProfileSetupResult, ProfileData
 
-    profile = ProfileData(name="Jane Doe", skills=["Python"])
     result = ProfileSetupResult(
         success=True,
         storage_path="/home/user/.config/runway-mcp/profile.json",

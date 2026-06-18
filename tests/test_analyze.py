@@ -7,7 +7,7 @@ Covers SC-01..SC-12 from the spec.
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
 from tools.jobs import JobPostingResult
 from tools.visa import VisaResult, Verdict
