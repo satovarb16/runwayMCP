@@ -58,3 +58,18 @@ def test_playwright_warning_not_emitted_when_available(capsys, monkeypatch):
 
     captured = capsys.readouterr()
     assert captured.err == ""
+
+
+def test_sc07_refresh_called_at_startup(monkeypatch):
+    """SC-07: refresh_to_latest_fy() must be called exactly once when server.py
+    is imported (module-level startup block), after all mcp.tool() registrations."""
+    import importlib
+    import unittest.mock as mock
+
+    # Patch before reload so the module-level call hits our mock
+    with mock.patch("tools.uscis_cache.refresh_to_latest_fy") as mock_refresh:
+        import server as server_mod
+
+        importlib.reload(server_mod)
+
+    mock_refresh.assert_called_once()
