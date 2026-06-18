@@ -14,16 +14,20 @@ from mcp.types import TextContent, CreateMessageResult
 # Helpers
 # ---------------------------------------------------------------------------
 
-_SAMPLE_PROFILE_JSON = json.dumps({
-    "name": "Jane Doe",
-    "email": "jane@example.com",
-    "location": "NYC",
-    "skills": ["Python", "Go"],
-    "experience": [{"company": "Acme", "title": "SWE", "duration_years": 2.5}],
-    "education": [{"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}],
-    "languages": ["English"],
-    "summary": "Engineer.",
-})
+_SAMPLE_PROFILE_JSON = json.dumps(
+    {
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "location": "NYC",
+        "skills": ["Python", "Go"],
+        "experience": [{"company": "Acme", "title": "SWE", "duration_years": 2.5}],
+        "education": [
+            {"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}
+        ],
+        "languages": ["English"],
+        "summary": "Engineer.",
+    }
+)
 
 
 def _make_ctx(response_json: str = _SAMPLE_PROFILE_JSON) -> MagicMock:

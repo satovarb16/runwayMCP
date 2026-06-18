@@ -28,7 +28,7 @@ class JobSummary(BaseModel):
 
 
 class VisaSummary(BaseModel):
-    verdict: str          # "GREEN" | "YELLOW" | "RED" | "UNKNOWN"
+    verdict: str  # "GREEN" | "YELLOW" | "RED" | "UNKNOWN"
     filings: int
     approval_rate: float
     error: str | None = None
@@ -46,9 +46,9 @@ class AnalyzeJobResult(BaseModel):
     job: JobSummary | None = None
     visa: VisaSummary | None = None
     match: MatchSummary | None = None
-    recommendation: str | None = None   # "APPLY" | "CONSIDER" | "SKIP" | None
-    error: str | None = None            # top-level error code: no_profile | fetch_failed
-    message: str | None = None          # human-readable explanation for top-level errors
+    recommendation: str | None = None  # "APPLY" | "CONSIDER" | "SKIP" | None
+    error: str | None = None  # top-level error code: no_profile | fetch_failed
+    message: str | None = None  # human-readable explanation for top-level errors
 
 
 # ---------------------------------------------------------------------------

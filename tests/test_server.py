@@ -1,4 +1,3 @@
-
 import pytest
 
 import server
@@ -38,6 +37,7 @@ def test_playwright_warning_emitted_to_stderr_when_unavailable(capsys, monkeypat
 
     # Re-execute the startup warning block that server.py will run
     import server as server_mod
+
     server_mod._warn_if_playwright_missing()
 
     captured = capsys.readouterr()
@@ -53,6 +53,7 @@ def test_playwright_warning_not_emitted_when_available(capsys, monkeypatch):
     monkeypatch.setattr(jobs_mod, "_PLAYWRIGHT_AVAILABLE", True)
 
     import server as server_mod
+
     server_mod._warn_if_playwright_missing()
 
     captured = capsys.readouterr()

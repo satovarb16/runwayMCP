@@ -136,10 +136,14 @@ class TestPydanticModels:
         from tools.analyze import AnalyzeJobResult, VisaSummary
 
         vs = VisaSummary(verdict="GREEN", filings=10, approval_rate=0.9)
-        assert not hasattr(vs, "confidence"), "VisaSummary must NOT have a 'confidence' field"
+        assert not hasattr(vs, "confidence"), (
+            "VisaSummary must NOT have a 'confidence' field"
+        )
 
         result = AnalyzeJobResult()
-        assert not hasattr(result, "confidence"), "AnalyzeJobResult must NOT have a 'confidence' field"
+        assert not hasattr(result, "confidence"), (
+            "AnalyzeJobResult must NOT have a 'confidence' field"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +156,7 @@ class TestComputeRecommendation:
 
     def _call(self, verdict: str, score: int | None) -> str | None:
         from tools.analyze import _compute_recommendation
+
         return _compute_recommendation(verdict, score)
 
     def test_score_none_returns_none(self):
@@ -212,7 +217,9 @@ class TestResultMappers:
     def test_map_visa_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92)
+        visa = _make_visa_result(
+            verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92
+        )
         summary = _map_visa(visa)
 
         assert summary.verdict == "GREEN"  # must be uppercase
@@ -239,7 +246,9 @@ class TestResultMappers:
         visa = _make_visa_result()
         summary = _map_visa(visa)
 
-        assert not hasattr(summary, "confidence"), "Mapped VisaSummary must NOT have 'confidence'"
+        assert not hasattr(summary, "confidence"), (
+            "Mapped VisaSummary must NOT have 'confidence'"
+        )
 
     def test_map_visa_error_defaults_none(self):
         from tools.analyze import _map_visa
@@ -252,7 +261,9 @@ class TestResultMappers:
     def test_map_match_success_result(self):
         from tools.analyze import _map_match
 
-        match = _make_match_result(score=80, matched_skills=["Python"], missing_skills=["Go"])
+        match = _make_match_result(
+            score=80, matched_skills=["Python"], missing_skills=["Go"]
+        )
         summary = _map_match(match)
 
         assert summary.score == 80
@@ -263,7 +274,9 @@ class TestResultMappers:
     def test_map_match_failed_result(self):
         from tools.analyze import _map_match
 
-        match = _make_match_result(success=False, score=None, error_message="sampling failed")
+        match = _make_match_result(
+            success=False, score=None, error_message="sampling failed"
+        )
         summary = _map_match(match)
 
         assert summary.score is None
@@ -272,7 +285,9 @@ class TestResultMappers:
     def test_map_visa_yellow_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6)
+        visa = _make_visa_result(
+            verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6
+        )
         summary = _map_visa(visa)
 
         assert summary.verdict == "YELLOW"
@@ -280,7 +295,9 @@ class TestResultMappers:
     def test_map_visa_red_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(verdict=Verdict.RED, total_filings=0, approval_rate=0.0)
+        visa = _make_visa_result(
+            verdict=Verdict.RED, total_filings=0, approval_rate=0.0
+        )
         summary = _map_visa(visa)
 
         assert summary.verdict == "RED"
@@ -300,13 +317,19 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92),
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "check_visa_sponsorship",
+            lambda company: _make_visa_result(
+                verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92
+            ),
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=80)),
         )
 
@@ -331,13 +354,19 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.RED, total_filings=0, approval_rate=0.0),
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "check_visa_sponsorship",
+            lambda company: _make_visa_result(
+                verdict=Verdict.RED, total_filings=0, approval_rate=0.0
+            ),
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=75)),
         )
 
@@ -354,13 +383,17 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: _make_visa_result(verdict=Verdict.GREEN),
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=35)),
         )
 
@@ -378,13 +411,19 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6),
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "check_visa_sponsorship",
+            lambda company: _make_visa_result(
+                verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6
+            ),
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=60)),
         )
 
@@ -400,13 +439,17 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: _make_visa_result(verdict=Verdict.GREEN),
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=70)),
         )
 
@@ -422,13 +465,17 @@ class TestAnalyzeJobHappyPath:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: _make_visa_result(verdict=Verdict.GREEN),
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "analyze_match",
             AsyncMock(return_value=_make_match_result(score=40)),
         )
 
@@ -445,7 +492,8 @@ class TestAnalyzeJobHappyPath:
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
         monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting",
+            analyze_mod,
+            "fetch_job_posting",
             lambda url: (_ for _ in ()).throw(RuntimeError("unexpected")),
         )
 
@@ -473,8 +521,11 @@ class TestFailurePaths:
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
 
         visa_spy = MM(side_effect=lambda company: _make_visa_result())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting",
-                            lambda url: (_ for _ in ()).throw(ValueError("page not found")))
+        monkeypatch.setattr(
+            analyze_mod,
+            "fetch_job_posting",
+            lambda url: (_ for _ in ()).throw(ValueError("page not found")),
+        )
         monkeypatch.setattr(analyze_mod, "check_visa_sponsorship", visa_spy)
 
         from tools.analyze import analyze_job
@@ -495,9 +546,12 @@ class TestFailurePaths:
 
         match_spy = AsyncMock(return_value=_make_match_result(score=75))
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: (_ for _ in ()).throw(RuntimeError("USCIS down")),
         )
         monkeypatch.setattr(analyze_mod, "analyze_match", match_spy)
@@ -518,16 +572,22 @@ class TestFailurePaths:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: _make_visa_result(verdict=Verdict.GREEN),
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
-            AsyncMock(return_value=_make_match_result(
-                success=False, score=None, error_message="sampling failed"
-            )),
+            analyze_mod,
+            "analyze_match",
+            AsyncMock(
+                return_value=_make_match_result(
+                    success=False, score=None, error_message="sampling failed"
+                )
+            ),
         )
 
         from tools.analyze import analyze_job
@@ -545,13 +605,17 @@ class TestFailurePaths:
         from tools import analyze as analyze_mod
 
         monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship",
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod,
+            "check_visa_sponsorship",
             lambda company: _make_visa_result(verdict=Verdict.GREEN),
         )
         monkeypatch.setattr(
-            analyze_mod, "analyze_match",
+            analyze_mod,
+            "analyze_match",
             AsyncMock(side_effect=RuntimeError("unexpected match error")),
         )
 
@@ -580,7 +644,8 @@ class TestProfilePrecondition:
 
         fetch_spy = MM(side_effect=lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "_read_profile",
+            analyze_mod,
+            "_read_profile",
             lambda: (_ for _ in ()).throw(FileNotFoundError("no profile")),
         )
         monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
@@ -605,8 +670,11 @@ class TestProfilePrecondition:
 
         fetch_spy = MM(side_effect=lambda url: _make_job_result())
         monkeypatch.setattr(
-            analyze_mod, "_read_profile",
-            lambda: (_ for _ in ()).throw(ValueError("No profile found. Run setup_profile first.")),
+            analyze_mod,
+            "_read_profile",
+            lambda: (_ for _ in ()).throw(
+                ValueError("No profile found. Run setup_profile first.")
+            ),
         )
         monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
 
@@ -665,8 +733,13 @@ class TestServerRegistration:
         import server
 
         tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
-        for expected in ("fetch_job_posting", "check_visa_sponsorship",
-                         "setup_profile", "update_profile", "analyze_match"):
+        for expected in (
+            "fetch_job_posting",
+            "check_visa_sponsorship",
+            "setup_profile",
+            "update_profile",
+            "analyze_match",
+        ):
             assert expected in tool_names, f"{expected} missing from tool registry"
 
     def test_analyze_job_result_is_pydantic_model(self):

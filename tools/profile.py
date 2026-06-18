@@ -99,9 +99,7 @@ def _read_cv_bytes(file_path: str) -> tuple[bytes, str]:
     path = Path(file_path)
 
     if not path.exists() or not path.is_file():
-        raise ValueError(
-            f"Failed to set up profile: file not found: {file_path}"
-        )
+        raise ValueError(f"Failed to set up profile: file not found: {file_path}")
 
     ext = path.suffix.lower()
     if ext not in _SUPPORTED:
@@ -204,9 +202,7 @@ def _read_profile(path: Path | None = None) -> ProfileData:
     """
     resolved = path if path is not None else _PROFILE_PATH
     if not resolved.exists():
-        raise ValueError(
-            "No profile found. Run setup_profile first."
-        )
+        raise ValueError("No profile found. Run setup_profile first.")
     try:
         return ProfileData.model_validate_json(resolved.read_text(encoding="utf-8"))
     except (ValidationError, ValueError) as exc:
@@ -300,9 +296,7 @@ async def _ingest(
     profile = _parse_sampled_json(result.content.text)
     _write_profile(profile, _PROFILE_PATH)
 
-    experience_years = sum(
-        (e.duration_years or 0.0) for e in profile.experience
-    )
+    experience_years = sum((e.duration_years or 0.0) for e in profile.experience)
 
     return ProfileSetupResult(
         success=True,

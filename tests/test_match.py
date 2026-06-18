@@ -14,30 +14,37 @@ from mcp.types import TextContent, CreateMessageResult
 # Helpers
 # ---------------------------------------------------------------------------
 
-_VALID_MATCH_JSON = json.dumps({
-    "score": 72,
-    "matched_skills": ["Python", "FastAPI"],
-    "missing_skills": ["Go"],
-    "experience_match": "Candidate has 3 years; role requires 2 years.",
-    "education_match": "BSc in CS matches requirement.",
-    "summary": "Candidate meets 72% of the job requirements based on skills and experience.",
-})
+_VALID_MATCH_JSON = json.dumps(
+    {
+        "score": 72,
+        "matched_skills": ["Python", "FastAPI"],
+        "missing_skills": ["Go"],
+        "experience_match": "Candidate has 3 years; role requires 2 years.",
+        "education_match": "BSc in CS matches requirement.",
+        "summary": "Candidate meets 72% of the job requirements based on skills and experience.",
+    }
+)
 
-_SAMPLE_PROFILE_JSON = json.dumps({
-    "name": "Jane Doe",
-    "email": "jane@example.com",
-    "location": "NYC",
-    "skills": ["Python", "FastAPI"],
-    "experience": [{"company": "Acme", "title": "SWE", "duration_years": 3.0}],
-    "education": [{"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}],
-    "languages": ["English"],
-    "summary": "Engineer.",
-})
+_SAMPLE_PROFILE_JSON = json.dumps(
+    {
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "location": "NYC",
+        "skills": ["Python", "FastAPI"],
+        "experience": [{"company": "Acme", "title": "SWE", "duration_years": 3.0}],
+        "education": [
+            {"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}
+        ],
+        "languages": ["English"],
+        "summary": "Engineer.",
+    }
+)
 
 
 def _make_job():
     """Return a minimal JobPostingResult."""
     from tools.jobs import JobPostingResult
+
     return JobPostingResult(
         title="Backend Engineer",
         company="StartupCo",
@@ -59,6 +66,7 @@ def _make_ctx(response_json: str = _VALID_MATCH_JSON) -> MagicMock:
 def _patch_profile_path(monkeypatch, tmp_path: Path) -> Path:
     """Redirect _PROFILE_PATH in tools.profile to a temp location."""
     import tools.profile as profile_mod
+
     new_path = tmp_path / "profile.json"
     monkeypatch.setattr(profile_mod, "_PROFILE_PATH", new_path)
     return new_path
@@ -105,14 +113,16 @@ def test_parse_match_json_score_150():
     """Score outside [0, 100] raises ValueError."""
     from tools.match import _parse_match_json
 
-    bad_json = json.dumps({
-        "score": 150,
-        "matched_skills": [],
-        "missing_skills": [],
-        "experience_match": "n/a",
-        "education_match": "n/a",
-        "summary": "test",
-    })
+    bad_json = json.dumps(
+        {
+            "score": 150,
+            "matched_skills": [],
+            "missing_skills": [],
+            "experience_match": "n/a",
+            "education_match": "n/a",
+            "summary": "test",
+        }
+    )
 
     with pytest.raises(ValueError):
         _parse_match_json(bad_json)
@@ -133,9 +143,7 @@ def test_build_match_prompt_embeds_job():
 
     messages = _build_match_prompt(job, profile)
 
-    combined = " ".join(
-        m.content.text for m in messages if hasattr(m.content, "text")
-    )
+    combined = " ".join(m.content.text for m in messages if hasattr(m.content, "text"))
     assert "Backend Engineer" in combined
     assert "StartupCo" in combined
 
@@ -150,9 +158,7 @@ def test_build_match_prompt_embeds_profile():
 
     messages = _build_match_prompt(job, profile)
 
-    combined = " ".join(
-        m.content.text for m in messages if hasattr(m.content, "text")
-    )
+    combined = " ".join(m.content.text for m in messages if hasattr(m.content, "text"))
     assert "Jane Doe" in combined
     assert "Python" in combined
 
@@ -167,11 +173,15 @@ def test_build_match_prompt_forbids_advice():
 
     messages = _build_match_prompt(job, profile)
 
-    combined = " ".join(
-        m.content.text for m in messages if hasattr(m.content, "text")
-    )
+    combined = " ".join(m.content.text for m in messages if hasattr(m.content, "text"))
     # At least one of these prohibition words must appear
-    prohibition_terms = ["no recommendation", "no advice", "factual", "objective", "forbid"]
+    prohibition_terms = [
+        "no recommendation",
+        "no advice",
+        "factual",
+        "objective",
+        "forbid",
+    ]
     assert any(term in combined.lower() for term in prohibition_terms), (
         f"Prompt must prohibit advice/recommendations. Got: {combined[:300]}"
     )
@@ -274,14 +284,16 @@ async def test_analyze_match_score_out_of_range(tmp_path, monkeypatch):
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(_SAMPLE_PROFILE_JSON, encoding="utf-8")
 
-    bad_json = json.dumps({
-        "score": 150,
-        "matched_skills": [],
-        "missing_skills": [],
-        "experience_match": "n/a",
-        "education_match": "n/a",
-        "summary": "test",
-    })
+    bad_json = json.dumps(
+        {
+            "score": 150,
+            "matched_skills": [],
+            "missing_skills": [],
+            "experience_match": "n/a",
+            "education_match": "n/a",
+            "summary": "test",
+        }
+    )
 
     job = _make_job()
     ctx = _make_ctx(bad_json)
@@ -308,14 +320,16 @@ async def test_analyze_match_empty_skills(tmp_path, monkeypatch):
         description="No specific skills listed.",
     )
 
-    empty_skills_json = json.dumps({
-        "score": 50,
-        "matched_skills": [],
-        "missing_skills": [],
-        "experience_match": "Meets requirement.",
-        "education_match": "Meets requirement.",
-        "summary": "Candidate meets 50% of requirements.",
-    })
+    empty_skills_json = json.dumps(
+        {
+            "score": 50,
+            "matched_skills": [],
+            "missing_skills": [],
+            "experience_match": "Meets requirement.",
+            "education_match": "Meets requirement.",
+            "summary": "Candidate meets 50% of requirements.",
+        }
+    )
 
     ctx = _make_ctx(empty_skills_json)
 

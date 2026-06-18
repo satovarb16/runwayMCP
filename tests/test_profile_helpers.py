@@ -78,16 +78,18 @@ def test_read_cv_bytes_extension_case_insensitive(tmp_path):
 # _parse_sampled_json
 # ---------------------------------------------------------------------------
 
-_VALID_JSON = json.dumps({
-    "name": "Jane Doe",
-    "email": "jane@example.com",
-    "location": "NYC",
-    "skills": ["Python", "Go"],
-    "experience": [{"company": "Acme", "title": "SWE"}],
-    "education": [{"institution": "MIT"}],
-    "languages": ["English"],
-    "summary": "Engineer.",
-})
+_VALID_JSON = json.dumps(
+    {
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "location": "NYC",
+        "skills": ["Python", "Go"],
+        "experience": [{"company": "Acme", "title": "SWE"}],
+        "education": [{"institution": "MIT"}],
+        "languages": ["English"],
+        "summary": "Engineer.",
+    }
+)
 
 
 def test_parse_sampled_json_clean():
@@ -126,12 +128,14 @@ def test_parse_sampled_json_schema_invalid():
     from tools.profile import _parse_sampled_json
 
     # skills should be a list, not a string
-    bad = json.dumps({
-        "name": "X",
-        "skills": "not-a-list",
-        "experience": [],
-        "education": [],
-    })
+    bad = json.dumps(
+        {
+            "name": "X",
+            "skills": "not-a-list",
+            "experience": [],
+            "education": [],
+        }
+    )
     with pytest.raises(ValueError, match="could not parse"):
         _parse_sampled_json(bad)
 

@@ -155,6 +155,7 @@ def test_visa_result_source_default_matches_fy2024():
 def test_source_label_matches_cache_url_year():
     """The FY year in CACHE_URL must match the FY year in VisaResult.source default."""
     import re
+
     url_match = re.search(r"datahubexport-(\d{4})\.csv", CACHE_URL)
     source_match = re.search(r"FY(\d{4})", VisaResult.model_fields["source"].default)
     assert url_match is not None, "CACHE_URL must contain a 4-digit year"

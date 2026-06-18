@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 
-
 # ---------------------------------------------------------------------------
 # Experience
 # ---------------------------------------------------------------------------
@@ -80,7 +79,9 @@ def test_profile_data_full():
         location="Buenos Aires",
         skills=["Python", "Go"],
         experience=[ExperienceEntry(company="Acme", title="SWE", duration_years=2.0)],
-        education=[EducationEntry(institution="UBA", degree="BSc", field="CS", year=2020)],
+        education=[
+            EducationEntry(institution="UBA", degree="BSc", field="CS", year=2020)
+        ],
         languages=["English", "Spanish"],
         summary="Experienced engineer.",
     )
@@ -101,7 +102,11 @@ def test_profile_setup_result_success_shape():
     result = ProfileSetupResult(
         success=True,
         storage_path="/home/user/.config/runway-mcp/profile.json",
-        profile_summary={"name": "Jane Doe", "skills_count": 1, "experience_years": 0.0},
+        profile_summary={
+            "name": "Jane Doe",
+            "skills_count": 1,
+            "experience_years": 0.0,
+        },
     )
     assert result.success is True
     assert result.storage_path is not None
