@@ -1,19 +1,42 @@
 """Orchestrator tool: analyze_job.
 
-Combines fetch_job_posting → check_visa_sponsorship → analyze_match into a
-single decision-ready envelope with a derived recommendation. Adds zero new
-external dependencies — all I/O is delegated to the three sub-tools.
+Combines fetch_job_posting → check_visa_sponsorship → profile load into a
+single envelope, then hands the data to the conversation-side Claude to score
+and recommend. The server performs NO LLM reasoning (no MCP sampling): it
+gathers the facts (job, visa history, stored profile) and the scoring rubric,
+and Claude produces the match score and APPLY/CONSIDER/SKIP verdict from them.
+
+Adds zero new external dependencies — all I/O is delegated to the sub-tools.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
-from mcp.server.fastmcp import Context
 
 from tools.jobs import fetch_job_posting, JobPostingResult
 from tools.visa import check_visa_sponsorship, VisaResult
-from tools.match import analyze_match, MatchResult
-from tools.profile import _read_profile
+from tools.profile import _read_profile, ProfileData
+
+
+# ---------------------------------------------------------------------------
+# Scoring rubric (applied by the conversation-side Claude, not the server)
+# ---------------------------------------------------------------------------
+
+_RECOMMENDATION_RULES: list[str] = [
+    "SKIP if the visa verdict is RED or the match score is below 40 "
+    "(SKIP takes precedence over APPLY).",
+    "APPLY if the visa verdict is GREEN and the match score is 70 or higher.",
+    "CONSIDER in every other case (including UNKNOWN or YELLOW visa verdicts).",
+]
+
+_SCORING_INSTRUCTIONS: str = (
+    "Using the job posting, the candidate profile, and the visa verdict above, "
+    "produce: (1) a technical-fit match score from 0 to 100 based on skills, "
+    "experience, and education; (2) matched_skills and missing_skills lists; "
+    "(3) a short, factual summary of the fit; and (4) a recommendation of "
+    "APPLY, CONSIDER, or SKIP by applying the recommendation_rules in order. "
+    "Be factual and objective — do not inflate the score."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,19 +57,25 @@ class VisaSummary(BaseModel):
     error: str | None = None
 
 
-class MatchSummary(BaseModel):
-    score: int | None = None
-    matched_skills: list[str] = []
-    missing_skills: list[str] = []
-    summary: str | None = None
-    error: str | None = None
+class ScoringGuide(BaseModel):
+    """Instructions + rubric for the conversation-side Claude to score the match."""
+
+    instructions: str
+    recommendation_rules: list[str]
 
 
 class AnalyzeJobResult(BaseModel):
+    """Decision-ready envelope of FACTS. Claude derives the score and verdict.
+
+    On success, job/visa/profile/scoring_guide are populated. The server does
+    not compute a match score or recommendation — those are left to Claude,
+    which reasons over this envelope and the scoring_guide.
+    """
+
     job: JobSummary | None = None
     visa: VisaSummary | None = None
-    match: MatchSummary | None = None
-    recommendation: str | None = None  # "APPLY" | "CONSIDER" | "SKIP" | None
+    profile: ProfileData | None = None
+    scoring_guide: ScoringGuide | None = None
     error: str | None = None  # top-level error code: no_profile | fetch_failed
     message: str | None = None  # human-readable explanation for top-level errors
 
@@ -54,24 +83,6 @@ class AnalyzeJobResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _compute_recommendation(verdict: str, score: int | None) -> str | None:
-    """Derive a deterministic recommendation from visa verdict and match score.
-
-    Precedence rules (in order):
-    1. score is None → None (match failed, no recommendation possible)
-    2. verdict == "RED" OR score < 40 → "SKIP"  (SKIP beats APPLY)
-    3. verdict == "GREEN" AND score >= 70 → "APPLY"
-    4. everything else (incl. UNKNOWN/YELLOW) → "CONSIDER"
-    """
-    if score is None:
-        return None
-    if verdict == "RED" or score < 40:
-        return "SKIP"
-    if verdict == "GREEN" and score >= 70:
-        return "APPLY"
-    return "CONSIDER"
 
 
 def _map_visa(visa_result: VisaResult, error: str | None = None) -> VisaSummary:
@@ -89,14 +100,11 @@ def _map_visa(visa_result: VisaResult, error: str | None = None) -> VisaSummary:
     )
 
 
-def _map_match(match_result: MatchResult) -> MatchSummary:
-    """Map a MatchResult to a MatchSummary for the envelope."""
-    return MatchSummary(
-        score=match_result.score,
-        matched_skills=match_result.matched_skills,
-        missing_skills=match_result.missing_skills,
-        summary=match_result.summary,
-        error=match_result.error_message if not match_result.success else None,
+def _scoring_guide() -> ScoringGuide:
+    """Build the scoring guide handed to Claude."""
+    return ScoringGuide(
+        instructions=_SCORING_INSTRUCTIONS,
+        recommendation_rules=list(_RECOMMENDATION_RULES),
     )
 
 
@@ -105,24 +113,26 @@ def _map_match(match_result: MatchResult) -> MatchSummary:
 # ---------------------------------------------------------------------------
 
 
-async def analyze_job(url: str, ctx: Context) -> AnalyzeJobResult:
-    """Orchestrate job analysis: fetch → visa check → match → recommendation.
+async def analyze_job(url: str) -> AnalyzeJobResult:
+    """Gather job + visa + profile for a posting so Claude can score the match.
 
-    Performs a full job analysis in one call:
+    Performs the data-gathering half of a job analysis in one call:
     1. Verifies a profile exists (returns error envelope if not).
     2. Fetches the job posting from the given URL.
     3. Checks H-1B visa sponsorship history for the company.
-    4. Scores the job against the stored profile.
-    5. Derives a deterministic recommendation (APPLY / CONSIDER / SKIP).
+    4. Returns the job, visa verdict, stored profile, and a scoring guide.
+
+    The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
+    this tool — after calling it, score the candidate profile against the job
+    and apply the scoring_guide's recommendation_rules in your reply.
 
     This tool NEVER raises — all failures are encoded in the return envelope.
 
     Args:
         url: The raw job posting URL to analyze.
-        ctx: Injected by FastMCP — forwarded to analyze_match for sampling.
 
     Returns:
-        AnalyzeJobResult with job, visa, match, and recommendation populated
+        AnalyzeJobResult with job, visa, profile, and scoring_guide populated
         on success, or error/message fields populated on failure.
     """
     # --- Step 1: Profile precondition (BEFORE any fetch) ---
@@ -167,23 +177,10 @@ async def analyze_job(url: str, ctx: Context) -> AnalyzeJobResult:
             error=str(exc),
         )
 
-    # --- Step 4: Match analysis (failure → null score + null recommendation) ---
-    match_summary: MatchSummary
-    try:
-        match_result: MatchResult = await analyze_match(job_result, ctx)
-        match_summary = _map_match(match_result)
-    except Exception as exc:
-        match_summary = MatchSummary(
-            score=None,
-            error=str(exc),
-        )
-
-    # --- Step 5: Derive recommendation ---
-    recommendation = _compute_recommendation(visa_summary.verdict, match_summary.score)
-
+    # --- Step 4: Hand facts + rubric to Claude for scoring ---
     return AnalyzeJobResult(
         job=job_summary,
         visa=visa_summary,
-        match=match_summary,
-        recommendation=recommendation,
+        profile=profile,
+        scoring_guide=_scoring_guide(),
     )
