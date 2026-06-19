@@ -46,15 +46,22 @@ pip install -e ".[dev]"
 
 Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and add `"cwd": "/path/to/runwayMCP"`.
 
-## First-time setup: ingest your CV
+> **Optional extra:** parsing Greenhouse *custom domains* needs Playwright. Most users can skip it — see [Optional: Playwright](#optional-playwright-for-javascript-heavy-job-boards).
 
-Before scoring job matches, store your CV once:
+## Step 0 (required): ingest your CV
+
+**Do this once before anything else.** `analyze_job` and `analyze_match` need a stored
+profile — without it they return an error asking you to run this first.
 
 ```
 You: "Set up my profile using my CV at /path/to/resume.pdf"
 ```
 
-Supports `.pdf` and `.docx`. Claude will ask for sampling approval — this is expected.
+**Accepted CV formats:** `.pdf` and `.docx` only.
+
+Claude will ask for sampling approval the first time — this is expected. Your profile is
+stored locally at `~/.config/runway-mcp/profile.json`. Updated your CV later? Just say
+"Update my profile with my new CV at ..." to replace it.
 
 ## Usage
 
@@ -69,14 +76,39 @@ On first run, the server downloads USCIS H-1B data (~2MB) automatically.
 
 ## Optional: Playwright for JavaScript-heavy job boards
 
-Some Greenhouse custom domains require a headless browser to parse. Install the optional extra:
+**You almost certainly don't need this.** It's only for parsing **Greenhouse custom
+domains** (a rare edge case). Canonical `boards.greenhouse.io`, Ashby, and Lever URLs
+always work without it. The server prints a harmless warning at startup if Playwright is
+missing — you can ignore it unless you hit a custom-domain Greenhouse URL.
 
-```bash
-pip install -e ".[dev,browser]"
-playwright install chromium
+Because `uvx` runs the server in an isolated environment, installing Playwright globally
+won't reach it — you must pull in the `browser` extra so it lands in the server's env.
+
+**If you installed via `uvx` / the plugin**, switch to a manual `.mcp.json` that requests
+the extra:
+
+```json
+{
+  "mcpServers": {
+    "runway-mcp": {
+      "command": "uvx",
+      "args": ["--from", "runway-mcp[browser]", "runway-mcp"]
+    }
+  }
+}
 ```
 
-Without it, canonical `boards.greenhouse.io` URLs always work. The server warns you at startup if Playwright is missing.
+**If you installed from source:**
+
+```bash
+pip install -e ".[browser]"
+```
+
+Then, either way, download the browser binary once:
+
+```bash
+playwright install chromium
+```
 
 > **Note**: `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Code will ask for your approval the first time these tools make a sampling request. This is expected behavior.
 
