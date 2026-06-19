@@ -1,7 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "runway-mcp"
 version = "0.1.0"
+description = "An MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "satovarb" }]
+keywords = ["mcp", "visa", "sponsorship", "f-1", "opt", "job-search"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
 
 dependencies = [
     "mcp>=1.2,<2",
@@ -10,6 +24,11 @@ dependencies = [
     "beautifulsoup4",
     "rapidfuzz",
 ]
+
+[project.urls]
+Homepage = "https://github.com/satovarb16/runwayMCP"
+Repository = "https://github.com/satovarb16/runwayMCP"
+Issues = "https://github.com/satovarb16/runwayMCP/issues"
 
 [project.scripts]
 runway-mcp = "server:main"
