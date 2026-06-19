@@ -1,0 +1,16 @@
+{
+  "name": "satovarb",
+  "owner": {
+    "name": "satovarb"
+  },
+  "metadata": {
+    "description": "Plugins by satovarb — starting with runway-mcp for visa-aware job filtering."
+  },
+  "plugins": [
+    {
+      "name": "runway-mcp",
+      "source": "./plugins/runway-mcp",
+      "description": "MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
+    }
+  ]
+}

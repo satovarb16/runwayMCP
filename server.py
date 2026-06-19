@@ -42,7 +42,10 @@ refresh_to_latest_fy()
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        pass  # clean exit on Ctrl+C when run interactively
 
 
 if __name__ == "__main__":

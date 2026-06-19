@@ -8,6 +8,17 @@ An MCP server that helps international students (F-1/OPT) filter US job postings
 
 ## Quick install
 
+### Option A: Claude Code plugin (recommended — two commands)
+
+```
+/plugin marketplace add satovarb16/runwayMCP
+/plugin install runway-mcp@satovarb
+```
+
+Claude Code wires up the MCP server for you — no JSON to edit.
+
+### Option B: manual `.mcp.json`
+
 Create a `.mcp.json` file in the directory where you run Claude Code:
 
 ```json
