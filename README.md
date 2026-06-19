@@ -17,6 +17,16 @@ An MCP server that helps international students (F-1/OPT) filter US job postings
 
 Claude Code wires up the MCP server for you — no JSON to edit.
 
+**Updating:** new releases arrive through the normal plugin flow — no need to touch PyPI.
+
+```
+/plugin marketplace update satovarb
+/plugin update runway-mcp@satovarb
+```
+
+Then run `/reload-plugins` (or restart Claude Code) to load the new version. The plugin
+pins an exact package version, so updating it pulls the matching server release.
+
 ### Option B: manual `.mcp.json`
 
 Create a `.mcp.json` file in the directory where you run Claude Code:
