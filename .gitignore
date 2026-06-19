@@ -33,3 +33,5 @@ Thumbs.db
 
 # Internal tooling
 .atl/
+# Local dev MCP config (run server from source); not shipped in the repo
+.mcp.json
