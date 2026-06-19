@@ -1,5 +1,9 @@
 # runwayMCP
 
+[![PyPI](https://img.shields.io/pypi/v/runway-mcp.svg)](https://pypi.org/project/runway-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/runway-mcp.svg)](https://pypi.org/project/runway-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An MCP server that helps international students (F-1/OPT) filter US job postings by technical fit AND visa sponsorship history — in a single call.
 
 ## Quick install
@@ -207,3 +211,7 @@ Highest-value next features (in priority order):
 4. **Lever custom domains** — same pattern as Greenhouse custom domains
 
 PRs welcome.
+
+## License
+
+[MIT](LICENSE) © satovarb
