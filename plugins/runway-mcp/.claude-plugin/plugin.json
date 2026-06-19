@@ -1,0 +1,11 @@
+{
+  "name": "runway-mcp",
+  "description": "MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT).",
+  "version": "0.1.1",
+  "author": {
+    "name": "satovarb"
+  },
+  "homepage": "https://github.com/satovarb16/runwayMCP",
+  "repository": "https://github.com/satovarb16/runwayMCP",
+  "license": "MIT"
+}
