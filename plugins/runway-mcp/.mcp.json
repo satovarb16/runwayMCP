@@ -2,7 +2,7 @@
   "mcpServers": {
     "runway-mcp": {
       "command": "uvx",
-      "args": ["runway-mcp"]
+      "args": ["--from", "runway-mcp==0.1.2", "runway-mcp"]
     }
   }
 }
