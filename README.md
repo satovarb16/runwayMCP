@@ -50,8 +50,8 @@ Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and
 
 ## Step 0 (required): ingest your CV
 
-**Do this once before anything else.** `analyze_job` and `analyze_match` need a stored
-profile — without it they return an error asking you to run this first.
+**Do this once before anything else.** `analyze_job` needs a stored profile — without it
+it returns an error asking you to run this first.
 
 ```
 You: "Set up my profile using my CV at /path/to/resume.pdf"
@@ -59,17 +59,17 @@ You: "Set up my profile using my CV at /path/to/resume.pdf"
 
 **Accepted CV formats:** `.pdf` and `.docx` only.
 
-Claude will ask for sampling approval the first time — this is expected. Your profile is
-stored locally at `~/.config/runway-mcp/profile.json`. Updated your CV later? Just say
-"Update my profile with my new CV at ..." to replace it.
+Claude reads your CV, extracts a structured profile, and saves it locally at
+`~/.config/runway-mcp/profile.json`. Updated your CV later? Just say "Update my profile
+with my new CV at ..." to replace it.
 
 ## Usage
 
 ```
 You: "Evaluate this role for me: https://jobs.example.com/swe-123"
 Claude:
-  → analyze_job(url) — fetches job + checks visa + scores CV match
-  → Returns APPLY / CONSIDER / SKIP + reasoning
+  → analyze_job(url) — fetches job + checks visa + loads your profile
+  → scores the CV match and returns APPLY / CONSIDER / SKIP + reasoning
 ```
 
 On first run, the server downloads USCIS H-1B data (~2MB) automatically.
@@ -110,21 +110,24 @@ Then, either way, download the browser binary once:
 playwright install chromium
 ```
 
-> **Note**: `setup_profile`, `analyze_match`, and `analyze_job` use MCP Sampling — Claude Code will ask for your approval the first time these tools make a sampling request. This is expected behavior.
-
 ---
 
 ## How it works
 
 Claude Code launches this server over stdio and calls its tools when relevant. You don't invoke the tools directly — Claude decides when to call them based on the conversation.
 
+The tools **fetch and shape data**; Claude does the reasoning. The server never calls
+back to the model (no MCP sampling), so it works on any MCP host — including Claude Code,
+which does not support sampling. Claude extracts your profile from the CV and scores the
+job-vs-profile match itself, using the rubric the tools return.
+
 **One-call flow (recommended):**
 
 ```
 You: "Evaluate this role for me: https://jobs.example.com/swe-123"
 Claude:
-  1. analyze_job(url) → job details + visa verdict + match score + APPLY/CONSIDER/SKIP
-  2. [reasons over the data] → context, red flags, application advice
+  1. analyze_job(url) → job details + visa verdict + your profile + scoring guide
+  2. [scores the match + applies the rubric] → APPLY/CONSIDER/SKIP, red flags, advice
 ```
 
 **Or use the individual tools directly:**
@@ -133,7 +136,7 @@ Claude:
 Claude:
   1. fetch_job_posting(url)          → job title, company, country, full JD
   2. check_visa_sponsorship(company) → H-1B history, approval rate, verdict
-  3. analyze_match(job)              → fit score vs your stored CV
+  3. get_profile()                   → your stored CV, to score the fit against
 ```
 
 The visa check only runs for US roles — Claude skips it for positions in other countries.
@@ -144,44 +147,47 @@ The visa check only runs for US roles — Claude skips it for positions in other
 |------|--------|
 | `fetch_job_posting` | ✅ Working — Greenhouse, Ashby, Lever, generic fallback |
 | `check_visa_sponsorship` | ✅ Working — real USCIS FY2024 data, auto-refreshes on startup |
-| `setup_profile` | ✅ Working — CV ingestion via MCP Sampling |
+| `setup_profile` | ✅ Working — saves the profile Claude extracts from your CV |
 | `update_profile` | ✅ Working — update stored CV |
-| `analyze_match` | ✅ Working — job-vs-CV scoring |
-| `analyze_job` | ✅ Working — one-call orchestrator |
+| `get_profile` | ✅ Working — returns the stored profile to score against |
+| `analyze_job` | ✅ Working — one-call data gatherer (Claude scores the match) |
 
 ## Tools
 
 ### `analyze_job(url: str) -> AnalyzeJobResult`
 
-One-call orchestrator. Fetches the job, checks visa sponsorship, and scores the match against your stored CV. Returns a combined envelope:
+One-call data gatherer. Fetches the job, checks visa sponsorship, and loads your stored profile, then returns a combined envelope plus a scoring guide. **Claude** scores the match and applies the recommendation rules — the server does not (no MCP sampling). Returns:
 
 ```json
 {
-  "job":    { "title": "...", "company": "...", "url": "..." },
-  "visa":   { "verdict": "GREEN", "filings": 42, "approval_rate": 0.91 },
-  "match":  { "score": 84, "matched_skills": [...], "missing_skills": [...], "summary": "..." },
-  "recommendation": "APPLY"
+  "job":     { "title": "...", "company": "...", "url": "..." },
+  "visa":    { "verdict": "GREEN", "filings": 42, "approval_rate": 0.91 },
+  "profile": { "name": "...", "skills": [...], "experience": [...] },
+  "scoring_guide": {
+    "instructions": "Score the match 0-100 and apply the rules...",
+    "recommendation_rules": ["SKIP if visa RED or score < 40 ...", "..."]
+  }
 }
 ```
 
-**Recommendation thresholds:**
+**Recommendation thresholds** (Claude applies these from the scoring guide):
 - `APPLY` — visa GREEN and score ≥ 70
 - `SKIP` — visa RED or score < 40 (SKIP takes precedence)
 - `CONSIDER` — everything else
 
 Requires a stored profile (run `setup_profile` first). If no profile exists, returns a clear error.
 
-### `setup_profile(cv_path: str) -> ProfileSetupResult`
+### `setup_profile(profile: ProfileData) -> ProfileSetupResult`
 
-Reads a CV file (`.pdf` or `.docx`), sends it to Claude for structured extraction, and stores the result at `~/.config/runway-mcp/profile.json`. Required before `analyze_match` or `analyze_job`.
+Persists a structured profile to `~/.config/runway-mcp/profile.json`. Claude reads your CV (`.pdf` or `.docx`) and extracts the `ProfileData` (name, skills, experience, education, …), then calls this tool to save it. Fails if a profile already exists — use `update_profile` to replace it. Required before `analyze_job`.
 
-### `update_profile(cv_path: str) -> ProfileSetupResult`
+### `update_profile(profile: ProfileData) -> ProfileSetupResult`
 
-Same as `setup_profile` but replaces an existing profile. Use when you update your CV.
+Same as `setup_profile` but overwrites an existing profile. Use when you update your CV.
 
-### `analyze_match(job: JobPostingResult) -> MatchResult`
+### `get_profile() -> GetProfileResult`
 
-Scores a job posting against your stored CV using Claude. Returns a 0–100 score with matched skills, missing skills, and a summary. Requires a stored profile.
+Returns the stored profile so Claude can score a job against it (e.g. in the individual-tools flow). Returns a structured `no_profile` error if none is stored yet.
 
 ### `check_visa_sponsorship(company: str) -> VisaResult`
 

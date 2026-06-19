@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runway-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "An MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,42 +1,38 @@
-"""Integration tests for _ingest, setup_profile, update_profile (Phase 3 — TDD RED/GREEN)."""
+"""Integration tests for _persist, setup_profile, update_profile, get_profile.
+
+Option A: the conversation-side Claude extracts the profile from the CV and
+passes structured ProfileData to these tools, which only persist/retrieve it.
+No MCP sampling, no CV file reading on the server.
+"""
 
 from __future__ import annotations
 
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-from mcp.types import TextContent, CreateMessageResult
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_SAMPLE_PROFILE_JSON = json.dumps(
-    {
-        "name": "Jane Doe",
-        "email": "jane@example.com",
-        "location": "NYC",
-        "skills": ["Python", "Go"],
-        "experience": [{"company": "Acme", "title": "SWE", "duration_years": 2.5}],
-        "education": [
-            {"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}
-        ],
-        "languages": ["English"],
-        "summary": "Engineer.",
-    }
-)
+_SAMPLE_PROFILE_DICT = {
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "location": "NYC",
+    "skills": ["Python", "Go"],
+    "experience": [{"company": "Acme", "title": "SWE", "duration_years": 2.5}],
+    "education": [{"institution": "MIT", "degree": "BSc", "field": "CS", "year": 2018}],
+    "languages": ["English"],
+    "summary": "Engineer.",
+}
+_SAMPLE_PROFILE_JSON = json.dumps(_SAMPLE_PROFILE_DICT)
 
 
-def _make_ctx(response_json: str = _SAMPLE_PROFILE_JSON) -> MagicMock:
-    """Return a fake Context whose session.create_message returns the given JSON."""
-    ctx = MagicMock()
-    result = MagicMock(spec=CreateMessageResult)
-    result.content = TextContent(type="text", text=response_json)
-    ctx.session.create_message = AsyncMock(return_value=result)
-    return ctx
+def _make_profile():
+    from tools.profile import ProfileData
+
+    return ProfileData.model_validate(_SAMPLE_PROFILE_DICT)
 
 
 def _patch_profile_path(monkeypatch, tmp_path: Path) -> Path:
@@ -49,20 +45,16 @@ def _patch_profile_path(monkeypatch, tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# _ingest — overwrite=False, no existing profile → success
+# _persist — overwrite=False, no existing profile → success
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_ingest_no_existing_profile_creates_file(tmp_path, monkeypatch):
-    from tools.profile import _ingest
+def test_persist_no_existing_profile_creates_file(tmp_path, monkeypatch):
+    from tools.profile import _persist
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
 
-    ctx = _make_ctx()
-    result = await _ingest(str(cv), ctx, overwrite=False)
+    result = _persist(_make_profile(), overwrite=False)
 
     assert result.success is True
     assert profile_path.exists()
@@ -72,43 +64,33 @@ async def test_ingest_no_existing_profile_creates_file(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _ingest — overwrite=False + profile exists → ValueError
+# _persist — overwrite=False + profile exists → ValueError
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_ingest_overwrite_false_profile_exists_raises(tmp_path, monkeypatch):
-    from tools.profile import _ingest
+def test_persist_overwrite_false_profile_exists_raises(tmp_path, monkeypatch):
+    from tools.profile import _persist
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
     profile_path.write_text('{"name": "Old"}', encoding="utf-8")
 
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
-
-    ctx = _make_ctx()
     with pytest.raises(ValueError, match="(?i)use update_profile"):
-        await _ingest(str(cv), ctx, overwrite=False)
+        _persist(_make_profile(), overwrite=False)
 
 
 # ---------------------------------------------------------------------------
-# _ingest — overwrite=True + profile exists → overwrites
+# _persist — overwrite=True + profile exists → overwrites
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_ingest_overwrite_true_replaces_existing(tmp_path, monkeypatch):
-    from tools.profile import _ingest
+def test_persist_overwrite_true_replaces_existing(tmp_path, monkeypatch):
+    from tools.profile import _persist
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text('{"name": "Old"}', encoding="utf-8")
 
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
-
-    ctx = _make_ctx()
-    result = await _ingest(str(cv), ctx, overwrite=True)
+    result = _persist(_make_profile(), overwrite=True)
 
     assert result.success is True
     loaded = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -116,38 +98,16 @@ async def test_ingest_overwrite_true_replaces_existing(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _ingest — sample returns malformed JSON → ValueError
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_ingest_malformed_sample_response_raises(tmp_path, monkeypatch):
-    from tools.profile import _ingest
-
-    _patch_profile_path(monkeypatch, tmp_path)
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
-
-    ctx = _make_ctx(response_json="{not valid json}")
-    with pytest.raises(ValueError, match="malformed JSON|could not parse"):
-        await _ingest(str(cv), ctx, overwrite=False)
-
-
-# ---------------------------------------------------------------------------
 # setup_profile — success path (via public API)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_setup_profile_success(tmp_path, monkeypatch):
+def test_setup_profile_success(tmp_path, monkeypatch):
     from tools.profile import setup_profile
 
     _patch_profile_path(monkeypatch, tmp_path)
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
 
-    ctx = _make_ctx()
-    result = await setup_profile(str(cv), ctx)
+    result = setup_profile(_make_profile())
 
     assert result.success is True
     assert result.profile_summary is not None
@@ -159,19 +119,14 @@ async def test_setup_profile_success(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_setup_profile_already_exists_returns_failure(tmp_path, monkeypatch):
+def test_setup_profile_already_exists_returns_failure(tmp_path, monkeypatch):
     from tools.profile import setup_profile
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text('{"name": "Old"}', encoding="utf-8")
 
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
-
-    ctx = _make_ctx()
-    result = await setup_profile(str(cv), ctx)
+    result = setup_profile(_make_profile())
 
     assert result.success is False
     assert "update_profile" in result.error_message
@@ -182,19 +137,14 @@ async def test_setup_profile_already_exists_returns_failure(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_update_profile_overwrites(tmp_path, monkeypatch):
+def test_update_profile_overwrites(tmp_path, monkeypatch):
     from tools.profile import update_profile
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text('{"name": "Old"}', encoding="utf-8")
 
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
-
-    ctx = _make_ctx()
-    result = await update_profile(str(cv), ctx)
+    result = update_profile(_make_profile())
 
     assert result.success is True
     loaded = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -206,23 +156,65 @@ async def test_update_profile_overwrites(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_update_profile_creates_when_missing(tmp_path, monkeypatch):
+def test_update_profile_creates_when_missing(tmp_path, monkeypatch):
     from tools.profile import update_profile
 
     profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    cv = tmp_path / "resume.pdf"
-    cv.write_bytes(b"%PDF fake content")
 
-    ctx = _make_ctx()
-    result = await update_profile(str(cv), ctx)
+    result = update_profile(_make_profile())
 
     assert result.success is True
     assert profile_path.exists()
 
 
 # ---------------------------------------------------------------------------
-# _read_profile — TDD RED (Phase 1.1)
+# get_profile
+# ---------------------------------------------------------------------------
+
+
+def test_get_profile_success(tmp_path, monkeypatch):
+    from tools.profile import get_profile
+
+    profile_path = _patch_profile_path(monkeypatch, tmp_path)
+    profile_path.write_text(_SAMPLE_PROFILE_JSON, encoding="utf-8")
+
+    result = get_profile()
+
+    assert result.success is True
+    assert result.profile is not None
+    assert result.profile.name == "Jane Doe"
+    assert result.profile.skills == ["Python", "Go"]
+    assert result.error is None
+
+
+def test_get_profile_no_profile(tmp_path, monkeypatch):
+    from tools.profile import get_profile
+
+    _patch_profile_path(monkeypatch, tmp_path)  # do not write a file
+
+    result = get_profile()
+
+    assert result.success is False
+    assert result.profile is None
+    assert result.error == "no_profile"
+    assert "setup_profile" in result.message
+
+
+def test_get_profile_corrupt(tmp_path, monkeypatch):
+    from tools.profile import get_profile
+
+    profile_path = _patch_profile_path(monkeypatch, tmp_path)
+    profile_path.write_text("{corrupt json!!}", encoding="utf-8")
+
+    result = get_profile()
+
+    assert result.success is False
+    assert result.error == "corrupt"
+    assert result.message is not None
+
+
+# ---------------------------------------------------------------------------
+# _read_profile
 # ---------------------------------------------------------------------------
 
 
@@ -268,7 +260,7 @@ def test_read_profile_corrupt(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# load_profile — public contract (TDD RED)
+# load_profile — public contract
 # ---------------------------------------------------------------------------
 
 

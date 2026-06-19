@@ -1,17 +1,18 @@
-"""Tests for tools/analyze.py — analyze_job orchestrator tool.
+"""Tests for tools/analyze.py — analyze_job orchestrator (Option A).
 
-Strict TDD: RED tests written first, then implementation makes them GREEN.
-Covers SC-01..SC-12 from the spec.
+analyze_job gathers FACTS (job, visa, profile) + a scoring guide. The match
+score and APPLY/CONSIDER/SKIP recommendation are produced by the
+conversation-side Claude, NOT the server — so this suite asserts the envelope
+contents, not a server-computed score/recommendation.
 """
 
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock
 
 from tools.jobs import JobPostingResult
 from tools.visa import VisaResult, Verdict
-from tools.match import MatchResult
+from tools.profile import ProfileData
 
 
 # ---------------------------------------------------------------------------
@@ -44,26 +45,8 @@ def _make_visa_result(
     )
 
 
-def _make_match_result(
-    success: bool = True,
-    score: int | None = 80,
-    matched_skills: list[str] | None = None,
-    missing_skills: list[str] | None = None,
-    summary: str | None = "Strong match.",
-    error_message: str | None = None,
-) -> MatchResult:
-    return MatchResult(
-        success=success,
-        score=score,
-        matched_skills=matched_skills if matched_skills is not None else ["Python"],
-        missing_skills=missing_skills if missing_skills is not None else ["Kubernetes"],
-        summary=summary,
-        error_message=error_message,
-    )
-
-
-def _make_ctx() -> MagicMock:
-    return MagicMock()
+def _make_profile() -> ProfileData:
+    return ProfileData(name="Jane Doe", skills=["Python"])
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +55,7 @@ def _make_ctx() -> MagicMock:
 
 
 class TestPydanticModels:
-    """T-01 — Verify model field names, types, and defaults."""
+    """Verify model field names, types, and defaults."""
 
     def test_job_summary_fields(self):
         from tools.analyze import JobSummary
@@ -97,28 +80,12 @@ class TestPydanticModels:
         assert vs.approval_rate == 0.75
         assert vs.error == "test"
 
-    def test_match_summary_defaults(self):
-        from tools.analyze import MatchSummary
+    def test_scoring_guide_fields(self):
+        from tools.analyze import ScoringGuide
 
-        ms = MatchSummary()
-        assert ms.score is None
-        assert ms.matched_skills == []
-        assert ms.missing_skills == []
-        assert ms.summary is None
-        assert ms.error is None
-
-    def test_match_summary_fields(self):
-        from tools.analyze import MatchSummary
-
-        ms = MatchSummary(
-            score=80,
-            matched_skills=["Python"],
-            missing_skills=["Go"],
-            summary="Good match.",
-        )
-        assert ms.score == 80
-        assert "Python" in ms.matched_skills
-        assert "Go" in ms.missing_skills
+        guide = ScoringGuide(instructions="do it", recommendation_rules=["a", "b"])
+        assert guide.instructions == "do it"
+        assert guide.recommendation_rules == ["a", "b"]
 
     def test_analyze_job_result_all_optional(self):
         from tools.analyze import AnalyzeJobResult
@@ -126,181 +93,101 @@ class TestPydanticModels:
         result = AnalyzeJobResult()
         assert result.job is None
         assert result.visa is None
-        assert result.match is None
-        assert result.recommendation is None
+        assert result.profile is None
+        assert result.scoring_guide is None
         assert result.error is None
         assert result.message is None
 
+    def test_analyze_job_result_no_match_or_recommendation_field(self):
+        """Option A: the server no longer computes match/recommendation."""
+        from tools.analyze import AnalyzeJobResult
+
+        result = AnalyzeJobResult()
+        assert not hasattr(result, "match"), "Server must NOT compute a match"
+        assert not hasattr(result, "recommendation"), (
+            "Server must NOT compute a recommendation"
+        )
+
     def test_analyze_job_result_no_confidence_field(self):
-        """The spec forbids a 'confidence' field anywhere in the envelope."""
         from tools.analyze import AnalyzeJobResult, VisaSummary
 
         vs = VisaSummary(verdict="GREEN", filings=10, approval_rate=0.9)
-        assert not hasattr(vs, "confidence"), (
-            "VisaSummary must NOT have a 'confidence' field"
-        )
+        assert not hasattr(vs, "confidence")
 
         result = AnalyzeJobResult()
-        assert not hasattr(result, "confidence"), (
-            "AnalyzeJobResult must NOT have a 'confidence' field"
-        )
+        assert not hasattr(result, "confidence")
 
 
 # ---------------------------------------------------------------------------
-# T-02: _compute_recommendation pure function
+# T-02: Visa mapper
 # ---------------------------------------------------------------------------
 
 
-class TestComputeRecommendation:
-    """T-02 — Full truth table including boundaries SC-11 and SC-12."""
-
-    def _call(self, verdict: str, score: int | None) -> str | None:
-        from tools.analyze import _compute_recommendation
-
-        return _compute_recommendation(verdict, score)
-
-    def test_score_none_returns_none(self):
-        assert self._call("GREEN", None) is None
-
-    def test_score_none_any_verdict_returns_none(self):
-        for verdict in ("GREEN", "YELLOW", "RED", "UNKNOWN"):
-            assert self._call(verdict, None) is None
-
-    def test_red_verdict_any_score_returns_skip(self):
-        assert self._call("RED", 75) == "SKIP"
-        assert self._call("RED", 100) == "SKIP"
-        assert self._call("RED", 0) == "SKIP"
-
-    def test_score_below_40_returns_skip(self):
-        assert self._call("GREEN", 39) == "SKIP"
-        assert self._call("YELLOW", 0) == "SKIP"
-        assert self._call("UNKNOWN", 10) == "SKIP"
-
-    def test_skip_beats_apply_green_plus_low_score(self):
-        """SC: GREEN verdict + score 30 → SKIP (SKIP has precedence)."""
-        assert self._call("GREEN", 30) == "SKIP"
-
-    def test_green_plus_score_70_returns_apply(self):
-        """SC-11: boundary — score exactly 70 → APPLY."""
-        assert self._call("GREEN", 70) == "APPLY"
-
-    def test_green_plus_score_above_70_returns_apply(self):
-        assert self._call("GREEN", 80) == "APPLY"
-        assert self._call("GREEN", 100) == "APPLY"
-
-    def test_score_exactly_40_returns_consider_not_skip(self):
-        """SC-12: SKIP fires only when score < 40; score==40 → CONSIDER."""
-        assert self._call("GREEN", 40) == "CONSIDER"
-        assert self._call("YELLOW", 40) == "CONSIDER"
-
-    def test_yellow_score_60_returns_consider(self):
-        """SC-04."""
-        assert self._call("YELLOW", 60) == "CONSIDER"
-
-    def test_unknown_score_75_returns_consider(self):
-        """SC-05."""
-        assert self._call("UNKNOWN", 75) == "CONSIDER"
-
-    def test_green_score_69_returns_consider(self):
-        """Just below APPLY threshold."""
-        assert self._call("GREEN", 69) == "CONSIDER"
-
-
-# ---------------------------------------------------------------------------
-# T-03: Result mappers
-# ---------------------------------------------------------------------------
-
-
-class TestResultMappers:
-    """T-03 — Verify visa and match mapper helpers."""
-
+class TestVisaMapper:
     def test_map_visa_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(
-            verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92
-        )
-        summary = _map_visa(visa)
-
-        assert summary.verdict == "GREEN"  # must be uppercase
+        summary = _map_visa(_make_visa_result(verdict=Verdict.GREEN))
+        assert summary.verdict == "GREEN"
 
     def test_map_visa_filings_from_total_filings(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(total_filings=42)
-        summary = _map_visa(visa)
-
+        summary = _map_visa(_make_visa_result(total_filings=42))
         assert summary.filings == 42
 
     def test_map_visa_approval_rate_passthrough(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(approval_rate=0.87)
-        summary = _map_visa(visa)
-
+        summary = _map_visa(_make_visa_result(approval_rate=0.87))
         assert summary.approval_rate == 0.87
 
     def test_map_visa_no_confidence_field(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result()
-        summary = _map_visa(visa)
-
-        assert not hasattr(summary, "confidence"), (
-            "Mapped VisaSummary must NOT have 'confidence'"
-        )
+        summary = _map_visa(_make_visa_result())
+        assert not hasattr(summary, "confidence")
 
     def test_map_visa_error_defaults_none(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result()
-        summary = _map_visa(visa)
-
+        summary = _map_visa(_make_visa_result())
         assert summary.error is None
-
-    def test_map_match_success_result(self):
-        from tools.analyze import _map_match
-
-        match = _make_match_result(
-            score=80, matched_skills=["Python"], missing_skills=["Go"]
-        )
-        summary = _map_match(match)
-
-        assert summary.score == 80
-        assert "Python" in summary.matched_skills
-        assert "Go" in summary.missing_skills
-        assert summary.error is None
-
-    def test_map_match_failed_result(self):
-        from tools.analyze import _map_match
-
-        match = _make_match_result(
-            success=False, score=None, error_message="sampling failed"
-        )
-        summary = _map_match(match)
-
-        assert summary.score is None
-        assert summary.error is not None
 
     def test_map_visa_yellow_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(
-            verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6
-        )
-        summary = _map_visa(visa)
-
+        summary = _map_visa(_make_visa_result(verdict=Verdict.YELLOW))
         assert summary.verdict == "YELLOW"
 
     def test_map_visa_red_verdict_uppercase(self):
         from tools.analyze import _map_visa
 
-        visa = _make_visa_result(
-            verdict=Verdict.RED, total_filings=0, approval_rate=0.0
-        )
-        summary = _map_visa(visa)
-
+        summary = _map_visa(_make_visa_result(verdict=Verdict.RED))
         assert summary.verdict == "RED"
+
+
+# ---------------------------------------------------------------------------
+# T-03: Scoring guide
+# ---------------------------------------------------------------------------
+
+
+class TestScoringGuide:
+    def test_scoring_guide_has_recommendation_rules(self):
+        from tools.analyze import _scoring_guide
+
+        guide = _scoring_guide()
+        assert len(guide.recommendation_rules) >= 3
+        combined = " ".join(guide.recommendation_rules).upper()
+        assert "SKIP" in combined
+        assert "APPLY" in combined
+        assert "CONSIDER" in combined
+
+    def test_scoring_guide_instructions_mention_score(self):
+        from tools.analyze import _scoring_guide
+
+        guide = _scoring_guide()
+        assert "score" in guide.instructions.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -309,14 +196,12 @@ class TestResultMappers:
 
 
 class TestAnalyzeJobHappyPath:
-    """T-04 — SC-01..SC-04 with all sub-tools mocked."""
-
     @pytest.mark.asyncio
-    async def test_sc01_apply(self, monkeypatch):
-        """SC-01: GREEN visa, score=80 → recommendation APPLY."""
+    async def test_happy_path_returns_facts_and_guide(self, monkeypatch):
         from tools import analyze as analyze_mod
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
+        profile = _make_profile()
+        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: profile)
         monkeypatch.setattr(
             analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
@@ -327,15 +212,10 @@ class TestAnalyzeJobHappyPath:
                 verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92
             ),
         )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=80)),
-        )
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.error is None
         assert result.job is not None
@@ -344,153 +224,17 @@ class TestAnalyzeJobHappyPath:
         assert result.visa.verdict == "GREEN"
         assert result.visa.filings == 15
         assert result.visa.approval_rate == 0.92
-        assert result.match is not None
-        assert result.match.score == 80
-        assert result.recommendation == "APPLY"
-
-    @pytest.mark.asyncio
-    async def test_sc02_skip_red_verdict(self, monkeypatch):
-        """SC-02: RED visa, score=75 → SKIP."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(
-                verdict=Verdict.RED, total_filings=0, approval_rate=0.0
-            ),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=75)),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.visa.verdict == "RED"
-        assert result.recommendation == "SKIP"
-
-    @pytest.mark.asyncio
-    async def test_sc03_skip_low_score(self, monkeypatch):
-        """SC-03: GREEN visa, score=35 → SKIP."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=35)),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.visa.verdict == "GREEN"
-        assert result.match.score == 35
-        assert result.recommendation == "SKIP"
-
-    @pytest.mark.asyncio
-    async def test_sc04_consider(self, monkeypatch):
-        """SC-04: YELLOW visa, score=60 → CONSIDER."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(
-                verdict=Verdict.YELLOW, total_filings=3, approval_rate=0.6
-            ),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=60)),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.recommendation == "CONSIDER"
-
-    @pytest.mark.asyncio
-    async def test_sc11_boundary_score_70_apply(self, monkeypatch):
-        """SC-11: GREEN + score exactly 70 → APPLY."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=70)),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.recommendation == "APPLY"
-
-    @pytest.mark.asyncio
-    async def test_sc12_boundary_score_40_consider(self, monkeypatch):
-        """SC-12: GREEN + score exactly 40 → CONSIDER (SKIP fires only at <40)."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(return_value=_make_match_result(score=40)),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.recommendation == "CONSIDER"
+        assert result.profile is not None
+        assert result.profile.name == "Jane Doe"
+        assert result.scoring_guide is not None
+        assert len(result.scoring_guide.recommendation_rules) >= 3
 
     @pytest.mark.asyncio
     async def test_analyze_job_never_raises(self, monkeypatch):
         """analyze_job must NEVER raise — all failures returned in envelope."""
         from tools import analyze as analyze_mod
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
+        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
         monkeypatch.setattr(
             analyze_mod,
             "fetch_job_posting",
@@ -499,8 +243,7 @@ class TestAnalyzeJobHappyPath:
 
         from tools.analyze import analyze_job
 
-        # Should not raise
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
         assert result is not None
 
 
@@ -510,15 +253,13 @@ class TestAnalyzeJobHappyPath:
 
 
 class TestFailurePaths:
-    """T-05 — SC-05, SC-07, SC-08."""
-
     @pytest.mark.asyncio
-    async def test_sc07_fetch_fails_stops_orchestration(self, monkeypatch):
-        """SC-07: fetch raises → error='fetch_failed', visa not called."""
+    async def test_fetch_fails_stops_orchestration(self, monkeypatch):
+        """fetch raises → error='fetch_failed', visa not called."""
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
+        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
 
         visa_spy = MM(side_effect=lambda company: _make_visa_result())
         monkeypatch.setattr(
@@ -530,22 +271,21 @@ class TestFailurePaths:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.error == "fetch_failed"
         assert "page not found" in result.message
         assert result.visa is None
-        assert result.match is None
-        assert result.recommendation is None
+        assert result.job is None
+        assert result.scoring_guide is None
         visa_spy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sc05_visa_fails_continues_to_match(self, monkeypatch):
-        """SC-05: visa raises → UNKNOWN verdict, match IS called, CONSIDER (score>=40)."""
+    async def test_visa_fails_continues_with_unknown(self, monkeypatch):
+        """visa raises → UNKNOWN verdict, envelope still returns job/profile/guide."""
         from tools import analyze as analyze_mod
 
-        match_spy = AsyncMock(return_value=_make_match_result(score=75))
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
+        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
         monkeypatch.setattr(
             analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
@@ -554,78 +294,16 @@ class TestFailurePaths:
             "check_visa_sponsorship",
             lambda company: (_ for _ in ()).throw(RuntimeError("USCIS down")),
         )
-        monkeypatch.setattr(analyze_mod, "analyze_match", match_spy)
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.visa.verdict == "UNKNOWN"
         assert result.visa.error is not None
-        assert result.match.score == 75
-        assert result.recommendation == "CONSIDER"
-        match_spy.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_sc08_match_fails_null_recommendation(self, monkeypatch):
-        """SC-08: match returns success=False → match.score=None, recommendation=None."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(
-                return_value=_make_match_result(
-                    success=False, score=None, error_message="sampling failed"
-                )
-            ),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.visa.verdict == "GREEN"
-        assert result.match.score is None
-        assert result.match.error is not None
-        assert result.recommendation is None
-
-    @pytest.mark.asyncio
-    async def test_match_raises_treated_as_failure(self, monkeypatch):
-        """analyze_match raising an exception → same as success=False."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: MagicMock())
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(verdict=Verdict.GREEN),
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "analyze_match",
-            AsyncMock(side_effect=RuntimeError("unexpected match error")),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
-
-        assert result.match is not None
-        assert result.match.score is None
-        assert result.recommendation is None
+        assert result.job is not None
+        assert result.profile is not None
+        assert result.scoring_guide is not None
 
 
 # ---------------------------------------------------------------------------
@@ -634,11 +312,8 @@ class TestFailurePaths:
 
 
 class TestProfilePrecondition:
-    """T-06 — SC-06: missing profile → structured error, fetch NOT called."""
-
     @pytest.mark.asyncio
-    async def test_sc06_no_profile_file_not_found_error(self, monkeypatch):
-        """FileNotFoundError from _read_profile → no_profile error envelope."""
+    async def test_no_profile_file_not_found_error(self, monkeypatch):
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
@@ -652,19 +327,18 @@ class TestProfilePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.error == "no_profile"
         assert "setup_profile" in result.message
         assert result.job is None
         assert result.visa is None
-        assert result.match is None
-        assert result.recommendation is None
+        assert result.profile is None
+        assert result.scoring_guide is None
         fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sc06_no_profile_value_error(self, monkeypatch):
-        """ValueError from _read_profile (e.g. empty profile) → no_profile envelope."""
+    async def test_no_profile_value_error(self, monkeypatch):
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
@@ -680,15 +354,14 @@ class TestProfilePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.error == "no_profile"
         assert "setup_profile" in result.message
         fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sc06_no_profile_returns_none(self, monkeypatch):
-        """_read_profile returning None → no_profile envelope."""
+    async def test_no_profile_returns_none(self, monkeypatch):
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
@@ -698,7 +371,7 @@ class TestProfilePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123", _make_ctx())
+        result = await analyze_job("https://example.com/job/123")
 
         assert result.error == "no_profile"
         assert result.job is None
@@ -711,25 +384,18 @@ class TestProfilePrecondition:
 
 
 class TestServerRegistration:
-    """T-07 — SC-09 (existing tools unchanged) and SC-10 (analyze_job registered)."""
-
-    def test_sc10_analyze_job_importable_from_tools_analyze(self):
-        """analyze_job must be importable from tools.analyze."""
+    def test_analyze_job_importable(self):
         from tools.analyze import analyze_job
 
         assert callable(analyze_job)
 
-    def test_sc10_analyze_job_registered_in_server(self):
-        """server.py must register analyze_job alongside the existing tools."""
+    def test_analyze_job_registered_in_server(self):
         import server
 
         tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
-        assert "analyze_job" in tool_names, (
-            f"analyze_job not found in registered tools: {tool_names}"
-        )
+        assert "analyze_job" in tool_names
 
-    def test_sc09_existing_tools_still_registered(self):
-        """The four existing tools must remain registered after adding analyze_job."""
+    def test_existing_tools_still_registered(self):
         import server
 
         tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
@@ -738,12 +404,17 @@ class TestServerRegistration:
             "check_visa_sponsorship",
             "setup_profile",
             "update_profile",
-            "analyze_match",
+            "get_profile",
         ):
             assert expected in tool_names, f"{expected} missing from tool registry"
 
+    def test_analyze_match_no_longer_registered(self):
+        import server
+
+        tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
+        assert "analyze_match" not in tool_names
+
     def test_analyze_job_result_is_pydantic_model(self):
-        """AnalyzeJobResult must be a Pydantic BaseModel."""
         from pydantic import BaseModel
         from tools.analyze import AnalyzeJobResult
 

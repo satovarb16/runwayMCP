@@ -14,19 +14,28 @@ def test_both_tools_registered():
 
 @pytest.mark.integration
 def test_profile_tools_registered():
-    """setup_profile and update_profile must be registered in the FastMCP instance."""
+    """setup_profile, update_profile, get_profile must be registered."""
     tool_manager = server.mcp._tool_manager
     registered_names = set(tool_manager._tools.keys())
     assert "setup_profile" in registered_names
     assert "update_profile" in registered_names
+    assert "get_profile" in registered_names
 
 
 @pytest.mark.integration
-def test_analyze_match_registered():
-    """analyze_match must be registered in the FastMCP instance."""
+def test_analyze_job_registered():
+    """analyze_job must be registered in the FastMCP instance."""
     tool_manager = server.mcp._tool_manager
     registered_names = set(tool_manager._tools.keys())
-    assert "analyze_match" in registered_names
+    assert "analyze_job" in registered_names
+
+
+@pytest.mark.integration
+def test_analyze_match_not_registered():
+    """analyze_match was removed in Option A — replaced by get_profile + Claude."""
+    tool_manager = server.mcp._tool_manager
+    registered_names = set(tool_manager._tools.keys())
+    assert "analyze_match" not in registered_names
 
 
 def test_playwright_warning_emitted_to_stderr_when_unavailable(capsys, monkeypatch):
