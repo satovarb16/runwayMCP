@@ -39,7 +39,7 @@ dev = [
     "pytest-asyncio",
     "responses",
     "pre-commit",
-    "ruff",
+    "ruff==0.15.18",
 ]
 browser = [
     "playwright>=1.40",
