@@ -340,10 +340,12 @@ def mark_applied(url: str, notes: str | None = None) -> MarkAppliedResult:
         return MarkAppliedResult(success=False, error="not_found")
 
     record = store.jobs[index]
-    updated_record = record.model_copy(update={
-        "applied": True,
-        "notes": notes if notes is not None else record.notes,
-    })
+    updated_record = record.model_copy(
+        update={
+            "applied": True,
+            "notes": notes if notes is not None else record.notes,
+        }
+    )
     store.jobs[index] = updated_record
 
     try:
