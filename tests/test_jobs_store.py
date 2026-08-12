@@ -277,6 +277,30 @@ def test_write_jobs_atomic_cleans_temp_on_error(tmp_path, monkeypatch):
     assert len(temp_files) == 0, f"Orphan temp files found: {temp_files}"
 
 
+def test_write_jobs_delegates_to_storage_atomic_write_json(tmp_path, monkeypatch):
+    """_write_jobs delegates atomic persistence to tools._storage.atomic_write_json."""
+    from tools.jobs_store import _write_jobs, JobStore
+    import tools._storage as storage_mod
+
+    jobs_path = tmp_path / "jobs.json"
+    store = JobStore(jobs=[])
+
+    calls = []
+
+    def fake_atomic_write_json(payload, path, *, tmp_prefix):
+        calls.append((payload, path, tmp_prefix))
+
+    monkeypatch.setattr(storage_mod, "atomic_write_json", fake_atomic_write_json)
+
+    _write_jobs(store, path=jobs_path)
+
+    assert len(calls) == 1
+    payload, path, tmp_prefix = calls[0]
+    assert payload is store
+    assert path == jobs_path
+    assert tmp_prefix == ".jobs_tmp_"
+
+
 # ---------------------------------------------------------------------------
 # T-05 / T-06: save_job_analysis (SC-03, SC-04, SC-05, SC-17)
 # ---------------------------------------------------------------------------
