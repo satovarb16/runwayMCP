@@ -10,11 +10,12 @@ Job records are stored at ~/.config/runway-mcp/jobs.json.
 
 from __future__ import annotations
 
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
+
+from tools import _storage
 
 # ---------------------------------------------------------------------------
 # ISO-8601 parsing helper
@@ -131,8 +132,8 @@ def _read_jobs(path: Path | None = None) -> JobStore:
 def _write_jobs(store: JobStore, path: Path | None = None) -> None:
     """Atomically write the jobs store as pretty-printed JSON.
 
-    Creates parent directories if they do not exist. Uses a temp-file +
-    rename pattern to avoid corrupting an existing store on partial write.
+    Delegates to tools._storage.atomic_write_json (temp-file + rename
+    pattern) to avoid corrupting an existing store on partial write.
 
     Args:
         store: The JobStore to persist.
@@ -140,19 +141,7 @@ def _write_jobs(store: JobStore, path: Path | None = None) -> None:
                time so tests can monkeypatch it).
     """
     resolved = path if path is not None else _JOBS_PATH
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_fd, tmp_path_str = tempfile.mkstemp(
-        dir=resolved.parent, prefix=".jobs_tmp_", suffix=".json"
-    )
-    tmp_path = Path(tmp_path_str)
-    try:
-        with open(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(store.model_dump_json(indent=2))
-        tmp_path.replace(resolved)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    _storage.atomic_write_json(store, resolved, tmp_prefix=".jobs_tmp_")
 
 
 # ---------------------------------------------------------------------------
