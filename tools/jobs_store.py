@@ -10,7 +10,11 @@ Job records are stored at ~/.config/runway-mcp/jobs.json.
 
 from __future__ import annotations
 
+import json
+import shutil
+import sys
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
@@ -47,9 +51,23 @@ def _parse_iso(value: str) -> datetime:
 
 _JOBS_PATH: Path = Path.home() / ".config" / "runway-mcp" / "jobs.json"
 
+_SCHEMA_VERSION: int = 2  # v1 == implicit legacy schema (`applied: bool`, no key)
+
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
+
+class ApplicationStatus(str, Enum):
+    """The 7 allowed application status values (binding, spec-defined)."""
+
+    NOT_APPLIED = "not_applied"
+    APPLIED = "applied"
+    INTERVIEWING = "interviewing"
+    OFFER = "offer"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    GHOSTED = "ghosted"
 
 
 class StoredJob(BaseModel):
@@ -60,7 +78,7 @@ class StoredJob(BaseModel):
     company: str
     visa_verdict: str  # GREEN | YELLOW | RED | UNKNOWN
     analyzed_at: str  # ISO-8601, server-stamped by save_job_analysis
-    applied: bool = False
+    status: ApplicationStatus = ApplicationStatus.NOT_APPLIED
     score: int | None = None  # 0-100, Claude-supplied (never computed server-side)
     recommendation: str | None = None  # APPLY | CONSIDER | SKIP | None, Claude-supplied
     notes: str | None = None
@@ -69,6 +87,7 @@ class StoredJob(BaseModel):
 class JobStore(BaseModel):
     """Top-level container for the jobs.json file."""
 
+    schema_version: int = _SCHEMA_VERSION
     jobs: list[StoredJob] = []
 
 
@@ -105,8 +124,91 @@ class MarkAppliedResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _coerce_legacy(raw: dict) -> tuple[dict, bool]:
+    """Coerce a pre-migration jobs payload to the current schema, in memory only.
+
+    For every job record that does not already carry a ``status`` key, the
+    legacy ``applied: bool`` field is renamed: ``True`` -> ``"applied"``,
+    ``False``/missing -> ``"not_applied"`` (SC-25, SC-26). The payload is then
+    stamped with ``schema_version = 2``. A payload already carrying
+    ``schema_version == 2`` whose records all have ``status`` is returned
+    unchanged (SC-27).
+
+    The per-record ``status`` check — not the top-level version stamp — is what
+    decides whether coercion runs. A file stamped version 2 that still holds a
+    legacy record (hand-edited, or written by external tooling) would otherwise
+    have its ``applied`` value silently dropped by pydantic as an unknown field
+    and default to ``not_applied``. The per-record guard is idempotent and
+    cheap, so it costs nothing to always run it.
+
+    Args:
+        raw: The parsed JSON payload (dict) read from the jobs store file.
+
+    Returns:
+        A tuple of ``(coerced_payload, was_legacy)`` where ``was_legacy`` is
+        True when the payload was not already at the current schema (used to
+        trigger a one-time backup before any legacy read).
+
+    Raises:
+        ValueError: if ``jobs`` is not a list, or any record is not an object.
+                    Raised rather than skipped so a malformed store surfaces as
+                    corrupt instead of silently losing records.
+    """
+    jobs = raw.get("jobs", [])
+    if not isinstance(jobs, list):
+        raise ValueError(f"expected 'jobs' to be a list, got {type(jobs).__name__}")
+
+    coerced_jobs = []
+    did_coerce = False
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise ValueError(
+                f"expected each job record to be an object, got {type(job).__name__}"
+            )
+        job = dict(job)
+        if "status" not in job:
+            applied = job.pop("applied", False)
+            job["status"] = "applied" if applied else "not_applied"
+            did_coerce = True
+        coerced_jobs.append(job)
+
+    was_legacy = did_coerce or raw.get("schema_version") != _SCHEMA_VERSION
+    if not was_legacy:
+        return raw, False
+
+    coerced = dict(raw)
+    coerced["jobs"] = coerced_jobs
+    coerced["schema_version"] = _SCHEMA_VERSION
+    return coerced, True
+
+
+def _backup_once(path: Path) -> None:
+    """Write a one-time ``.bak`` copy of a legacy jobs store before coercion.
+
+    Best-effort: any OSError while copying is swallowed with a stderr warning
+    so a failed backup never blocks the read path. Skips silently if the
+    backup already exists (forward-only after the first legacy read).
+
+    Args:
+        path: Path to the jobs store file being backed up.
+    """
+    backup_path = path.with_name(path.name + ".bak")
+    if backup_path.exists():
+        return
+    try:
+        shutil.copyfile(path, backup_path)
+    except OSError as exc:
+        print(f"Warning: failed to write jobs store backup: {exc}", file=sys.stderr)
+
+
 def _read_jobs(path: Path | None = None) -> JobStore:
     """Read and parse the stored jobs JSON.
+
+    Pre-validation-coerces legacy (pre-migration) records via
+    `_coerce_legacy` before handing the payload to pydantic, so old
+    `applied: bool` records load cleanly as `status` (SC-25..SC-27). When a
+    legacy payload is detected, a one-time `.bak` backup is written first
+    (best-effort, see `_backup_once`) before coercion is applied in memory.
 
     Args:
         path: Path to the jobs JSON file. If None, uses the module-level
@@ -118,13 +220,22 @@ def _read_jobs(path: Path | None = None) -> JobStore:
 
     Raises:
         ValueError: if the file exists but its content is malformed JSON or
-                    fails pydantic validation. The file is never auto-repaired.
+                    fails pydantic validation (even after coercion). The file
+                    is never auto-repaired.
     """
     resolved = path if path is not None else _JOBS_PATH
     if not resolved.exists():
         return JobStore(jobs=[])
     try:
-        return JobStore.model_validate_json(resolved.read_text(encoding="utf-8"))
+        raw = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"expected a JSON object at the top level, got {type(raw).__name__}"
+            )
+        coerced, was_legacy = _coerce_legacy(raw)
+        if was_legacy:
+            _backup_once(resolved)
+        return JobStore.model_validate(coerced)
     except (ValidationError, ValueError) as exc:
         raise ValueError(f"Jobs store is corrupt: {exc}") from exc
 
@@ -188,8 +299,12 @@ def save_job_analysis(
     updated = existing_index is not None
 
     try:
-        # FIX 3: preserve `applied` on upsert; default False for new records
-        existing_applied = store.jobs[existing_index].applied if updated else False
+        # FIX 3: preserve `status` on upsert; default NOT_APPLIED for new records
+        existing_status = (
+            store.jobs[existing_index].status
+            if updated
+            else ApplicationStatus.NOT_APPLIED
+        )
 
         # Build the new record (server stamps analyzed_at)
         # FIX 2: StoredJob construction is inside the try so ValidationError is caught
@@ -199,7 +314,7 @@ def save_job_analysis(
             company=company,
             visa_verdict=visa_verdict,
             analyzed_at=datetime.now(timezone.utc).isoformat(),
-            applied=existing_applied,
+            status=existing_status,
             score=score,
             recommendation=recommendation,
             notes=notes,
@@ -236,8 +351,10 @@ def list_jobs(
     Args:
         since:     ISO-8601 string cutoff (inclusive). Only jobs where
                    analyzed_at >= since are returned (lexicographic compare).
-        applied:   If True, return only applied jobs. If False, return only
-                   non-applied jobs. If None (default), no filter applied.
+        applied:   If True, return only jobs whose status is "applied". If
+                   False, return only jobs whose status is NOT "applied"
+                   (any other status counts as not-applied). If None
+                   (default), no filter applied.
         min_score: Minimum score threshold (inclusive). Jobs with score=None
                    are excluded when this filter is active.
         limit:     Maximum number of records to return (after sort).
@@ -268,7 +385,14 @@ def list_jobs(
                 error_message=f"Invalid 'since' timestamp or corrupt record timestamp: {exc}",
             )
     if applied is not None:
-        items = [j for j in items if j.applied == applied]
+        # "Applied" means any post-application status, not the literal APPLIED
+        # member: a job in interviewing/offer/rejected/withdrawn/ghosted has
+        # definitively been applied to. Comparing against APPLIED alone would
+        # drop progressed applications from applied=True and resurface them
+        # under applied=False. Superseded by the status filter in PR3.
+        items = [
+            j for j in items if (j.status != ApplicationStatus.NOT_APPLIED) == applied
+        ]
     if min_score is not None:
         items = [j for j in items if j.score is not None and j.score >= min_score]
 
@@ -305,8 +429,9 @@ def list_jobs(
 def mark_applied(url: str, notes: str | None = None) -> MarkAppliedResult:
     """Mark a job record as applied.
 
-    Sets ``applied=True`` on the record matching ``url``. If ``notes`` is
-    provided, updates the notes field; otherwise leaves it unchanged.
+    Sets ``status=ApplicationStatus.APPLIED`` on the record matching ``url``.
+    If ``notes`` is provided, updates the notes field; otherwise leaves it
+    unchanged.
     Returns success=False with error="not_found" when no record matches.
     This tool NEVER raises.
 
@@ -331,7 +456,7 @@ def mark_applied(url: str, notes: str | None = None) -> MarkAppliedResult:
     record = store.jobs[index]
     updated_record = record.model_copy(
         update={
-            "applied": True,
+            "status": ApplicationStatus.APPLIED,
             "notes": notes if notes is not None else record.notes,
         }
     )
