@@ -1009,6 +1009,91 @@ def test_save_job_analysis_invalid_score_returns_error(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_save_job_analysis_upsert_preserves_score_and_recommendation(
+    tmp_path, monkeypatch
+):
+    """An omitted field means "leave it alone" — for all four, not just some.
+
+    Preserving status and notes but not score/recommendation made a bare
+    re-save of a reposted listing destroy the stored analysis, which also
+    dropped the job out of every min_score query.
+    """
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
+
+    url = "https://example.com/job/analysis"
+    save_job_analysis(
+        url=url,
+        title="Engineer",
+        company="Acme",
+        visa_verdict="GREEN",
+        score=85,
+        recommendation="APPLY",
+    )
+    set_application_status(url=url, status="interviewing", notes="phone screen 6/12")
+
+    save_job_analysis(
+        url=url, title="Engineer (reposted)", company="Acme", visa_verdict="GREEN"
+    )
+
+    record = _read_jobs().jobs[0]
+    assert record.score == 85
+    assert record.recommendation == "APPLY"
+    assert record.status == "interviewing"
+    assert record.notes == "phone screen 6/12"
+
+
+def test_save_job_analysis_explicit_score_overwrites(tmp_path, monkeypatch):
+    """A fresh analysis still replaces the old score."""
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import save_job_analysis, _read_jobs
+
+    url = "https://example.com/job/rescore"
+    save_job_analysis(
+        url=url,
+        title="E",
+        company="C",
+        visa_verdict="GREEN",
+        score=85,
+        recommendation="APPLY",
+    )
+    save_job_analysis(
+        url=url,
+        title="E",
+        company="C",
+        visa_verdict="GREEN",
+        score=40,
+        recommendation="SKIP",
+    )
+
+    record = _read_jobs().jobs[0]
+    assert record.score == 40
+    assert record.recommendation == "SKIP"
+
+
+def test_read_jobs_refuses_a_store_from_a_newer_schema(tmp_path):
+    """A store written by a newer version must not be silently downgraded.
+
+    Treating any version mismatch as "legacy" re-stamped a v3 file as v2 and
+    let pydantic drop the fields it did not know about, so the next write
+    persisted the lossy version.
+    """
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    payload = {
+        "schema_version": 999,
+        "jobs": [_legacy_job_dict(applied=True)],
+    }
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="(?i)newer"):
+        _read_jobs(path=jobs_path)
+
+    # and the file on disk is untouched
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["schema_version"] == 999
+
+
 def test_save_job_analysis_upsert_preserves_notes(tmp_path, monkeypatch):
     """Re-analyzing a reposted listing must not wipe application-tracking notes."""
     _patch_jobs_path(monkeypatch, tmp_path)
