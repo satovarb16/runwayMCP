@@ -1,4 +1,4 @@
-"""Job store persistence tools: save_job_analysis, list_jobs, mark_applied.
+"""Job store persistence tools: save_job_analysis, list_jobs, set_application_status.
 
 The conversation-side Claude analyzes a job posting and produces a score and
 recommendation. These tools PERSIST and RETRIEVE that structured data — they
@@ -6,6 +6,12 @@ never call back to the model. This keeps the server free of MCP sampling and
 matches the project's philosophy: tools shape data, Claude reasons.
 
 Job records are stored at ~/.config/runway-mcp/jobs.json.
+
+Every mutating tool here does a whole-file read-modify-write. atomic_write_json
+guarantees the file is never left corrupt, but not that no write is lost: two
+tool calls dispatched close together can read the same snapshot, and the later
+write wins. Acceptable for a single-user local server; if this ever serves
+concurrent callers, the read-modify-write needs a file lock.
 """
 
 from __future__ import annotations
@@ -110,12 +116,16 @@ class ListJobsResult(BaseModel):
     error_message: str | None = None
 
 
-class MarkAppliedResult(BaseModel):
-    """Return value for mark_applied."""
+class SetStatusResult(BaseModel):
+    """Return value for set_application_status."""
 
     success: bool
     url: str | None = None
-    error: str | None = None  # "not_found" | "corrupt"
+    status: str | None = None
+    previous_status: str | None = None
+    error: str | None = (
+        None  # "not_found" | "corrupt" | "invalid_status" | "write_error"
+    )
     message: str | None = None
 
 
@@ -220,8 +230,11 @@ def _read_jobs(path: Path | None = None) -> JobStore:
 
     Raises:
         ValueError: if the file exists but its content is malformed JSON or
-                    fails pydantic validation (even after coercion). The file
-                    is never auto-repaired.
+                    fails pydantic validation (even after coercion), or if it
+                    cannot be read at all (permissions, path is a directory).
+                    OSError is wrapped rather than propagated so every caller's
+                    existing `except ValueError` keeps the tool boundary
+                    exception-free. The file is never auto-repaired.
     """
     resolved = path if path is not None else _JOBS_PATH
     if not resolved.exists():
@@ -236,6 +249,11 @@ def _read_jobs(path: Path | None = None) -> JobStore:
         if was_legacy:
             _backup_once(resolved)
         return JobStore.model_validate(coerced)
+    except OSError as exc:
+        # Unreadable is not the same as corrupt — the file may be perfectly
+        # valid. Wrapped as ValueError so callers need only one except clause
+        # and no OSError ever reaches the MCP boundary as a raw traceback.
+        raise ValueError(f"Jobs store is unreadable: {exc}") from exc
     except (ValidationError, ValueError) as exc:
         raise ValueError(f"Jobs store is corrupt: {exc}") from exc
 
@@ -305,6 +323,11 @@ def save_job_analysis(
             if updated
             else ApplicationStatus.NOT_APPLIED
         )
+        # Preserve `notes` on upsert for the same reason status is preserved:
+        # set_application_status writes application-tracking notes ("phone
+        # screen 6/12"), and re-analyzing a reposted listing must not wipe
+        # them. An explicit notes argument still overwrites.
+        existing_notes = store.jobs[existing_index].notes if updated else None
 
         # Build the new record (server stamps analyzed_at)
         # FIX 2: StoredJob construction is inside the try so ValidationError is caught
@@ -317,7 +340,7 @@ def save_job_analysis(
             status=existing_status,
             score=score,
             recommendation=recommendation,
-            notes=notes,
+            notes=notes if notes is not None else existing_notes,
         )
 
         if updated:
@@ -339,7 +362,7 @@ def save_job_analysis(
 
 def list_jobs(
     since: str | None = None,
-    applied: bool | None = None,
+    status: str | None = None,
     min_score: int | None = None,
     limit: int | None = None,
     sort_by: str = "analyzed_at",
@@ -351,10 +374,9 @@ def list_jobs(
     Args:
         since:     ISO-8601 string cutoff (inclusive). Only jobs where
                    analyzed_at >= since are returned (lexicographic compare).
-        applied:   If True, return only jobs whose status is "applied". If
-                   False, return only jobs whose status is NOT "applied"
-                   (any other status counts as not-applied). If None
-                   (default), no filter applied.
+        status:    If provided, return only jobs whose status exactly matches
+                   this value (one of the 7 ApplicationStatus members). If
+                   None (default), no filter applied.
         min_score: Minimum score threshold (inclusive). Jobs with score=None
                    are excluded when this filter is active.
         limit:     Maximum number of records to return (after sort).
@@ -384,15 +406,18 @@ def list_jobs(
                 success=False,
                 error_message=f"Invalid 'since' timestamp or corrupt record timestamp: {exc}",
             )
-    if applied is not None:
-        # "Applied" means any post-application status, not the literal APPLIED
-        # member: a job in interviewing/offer/rejected/withdrawn/ghosted has
-        # definitively been applied to. Comparing against APPLIED alone would
-        # drop progressed applications from applied=True and resurface them
-        # under applied=False. Superseded by the status filter in PR3.
-        items = [
-            j for j in items if (j.status != ApplicationStatus.NOT_APPLIED) == applied
-        ]
+    if status is not None:
+        try:
+            status_member = ApplicationStatus(status)
+        except ValueError:
+            return ListJobsResult(
+                success=False,
+                error_message=(
+                    f"Invalid status: {status!r} (use one of: "
+                    f"{', '.join(m.value for m in ApplicationStatus)})"
+                ),
+            )
+        items = [j for j in items if j.status == status_member]
     if min_score is not None:
         items = [j for j in items if j.score is not None and j.score >= min_score]
 
@@ -426,37 +451,57 @@ def list_jobs(
     return ListJobsResult(success=True, jobs=items, count=len(items))
 
 
-def mark_applied(url: str, notes: str | None = None) -> MarkAppliedResult:
-    """Mark a job record as applied.
+def set_application_status(
+    url: str, status: str, notes: str | None = None
+) -> SetStatusResult:
+    """Set the application status of a stored job record.
 
-    Sets ``status=ApplicationStatus.APPLIED`` on the record matching ``url``.
-    If ``notes`` is provided, updates the notes field; otherwise leaves it
-    unchanged.
-    Returns success=False with error="not_found" when no record matches.
-    This tool NEVER raises.
+    Transitions are deliberately UNVALIDATED — any of the 7 status values may
+    transition to any other (e.g. "rejected" -> "interviewing" succeeds; there
+    is no state machine). If ``notes`` is provided, updates the notes field;
+    otherwise leaves it unchanged. Returns success=False with
+    error="not_found" when no record matches ``url``, or error="invalid_status"
+    when ``status`` is not one of the 7 defined values. This tool NEVER raises.
 
     Args:
-        url:   The job posting URL identifying the record to update.
-        notes: Optional notes to attach (replaces existing notes if provided).
+        url:    The job posting URL identifying the record to update.
+        status: One of: not_applied, applied, interviewing, offer, rejected,
+                withdrawn, ghosted.
+        notes:  Optional notes to attach (replaces existing notes if provided).
 
     Returns:
-        MarkAppliedResult with success=True and the url on success;
-        success=False with error="not_found" when no record matches;
-        success=False with error/message on store read/write failure.
+        SetStatusResult with success=True, url, status, and previous_status on
+        success; success=False with error="invalid_status" when status is not
+        recognized (record unchanged); success=False with error="not_found"
+        when no record matches; success=False with error/message on store
+        read/write failure.
     """
+    try:
+        status_member = ApplicationStatus(status)
+    except ValueError:
+        return SetStatusResult(
+            success=False,
+            error="invalid_status",
+            message=(
+                f"Invalid status: {status!r} (use one of: "
+                f"{', '.join(m.value for m in ApplicationStatus)})"
+            ),
+        )
+
     try:
         store = _read_jobs()
     except ValueError as exc:
-        return MarkAppliedResult(success=False, error="corrupt", message=str(exc))
+        return SetStatusResult(success=False, error="corrupt", message=str(exc))
 
     index = next((i for i, j in enumerate(store.jobs) if j.url == url), None)
     if index is None:
-        return MarkAppliedResult(success=False, error="not_found")
+        return SetStatusResult(success=False, error="not_found")
 
     record = store.jobs[index]
+    previous_status = record.status
     updated_record = record.model_copy(
         update={
-            "status": ApplicationStatus.APPLIED,
+            "status": status_member,
             "notes": notes if notes is not None else record.notes,
         }
     )
@@ -465,6 +510,12 @@ def mark_applied(url: str, notes: str | None = None) -> MarkAppliedResult:
     try:
         _write_jobs(store)
     except Exception as exc:
-        return MarkAppliedResult(success=False, error="write_error", message=str(exc))
+        return SetStatusResult(success=False, error="write_error", message=str(exc))
 
-    return MarkAppliedResult(success=True, url=url, message="Marked as applied.")
+    return SetStatusResult(
+        success=True,
+        url=url,
+        status=status_member.value,
+        previous_status=previous_status.value,
+        message=f"Status set to {status_member.value}.",
+    )

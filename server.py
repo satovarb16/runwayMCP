@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from tools.analyze import analyze_job
 from tools.jobs import fetch_job_posting
-from tools.jobs_store import list_jobs, mark_applied, save_job_analysis
+from tools.jobs_store import list_jobs, save_job_analysis, set_application_status
 from tools.profile import get_profile, setup_profile, update_profile
 from tools.uscis_cache import refresh_to_latest_fy
 from tools.visa import check_visa_sponsorship
@@ -38,7 +38,7 @@ mcp.tool()(get_profile)
 mcp.tool()(analyze_job)
 mcp.tool()(save_job_analysis)
 mcp.tool()(list_jobs)
-mcp.tool()(mark_applied)
+mcp.tool()(set_application_status)
 
 _warn_if_playwright_missing()
 refresh_to_latest_fy()
