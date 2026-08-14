@@ -38,7 +38,7 @@ def _make_job(**overrides) -> dict:
         "company": "Acme Corp",
         "visa_verdict": "GREEN",
         "analyzed_at": "2025-06-01T00:00:00+00:00",
-        "applied": False,
+        "status": "not_applied",
         "score": None,
         "recommendation": None,
         "notes": None,
@@ -65,7 +65,7 @@ def test_stored_job_defaults():
         analyzed_at="2025-01-01T00:00:00Z",
     )
 
-    assert job.applied is False
+    assert job.status == "not_applied"
     assert job.score is None
     assert job.recommendation is None
     assert job.notes is None
@@ -82,13 +82,13 @@ def test_stored_job_all_fields():
         company="Beta",
         visa_verdict="YELLOW",
         analyzed_at="2025-03-01T00:00:00Z",
-        applied=True,
+        status="applied",
         score=75,
         recommendation="APPLY",
         notes="Looks good",
     )
 
-    assert job.applied is True
+    assert job.status == "applied"
     assert job.score == 75
     assert job.recommendation == "APPLY"
     assert job.notes == "Looks good"
@@ -327,7 +327,7 @@ def test_save_job_analysis_new_url_success(tmp_path, monkeypatch):
 
 
 def test_save_job_analysis_file_created_with_correct_fields(tmp_path, monkeypatch):
-    """SC-03: saved record has applied=False, score, recommendation stored verbatim."""
+    """SC-03: saved record has status="not_applied", score, recommendation stored verbatim."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import save_job_analysis, _read_jobs
 
@@ -343,7 +343,7 @@ def test_save_job_analysis_file_created_with_correct_fields(tmp_path, monkeypatc
     store = _read_jobs(path=jobs_path)
     assert len(store.jobs) == 1
     record = store.jobs[0]
-    assert record.applied is False
+    assert record.status == "not_applied"
     assert record.score == 85
     assert record.recommendation == "APPLY"
 
@@ -493,8 +493,8 @@ def test_list_jobs_applied_true_filter(tmp_path, monkeypatch):
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
 
-    job_a = StoredJob(**_make_job(url="https://a.com", applied=True))
-    job_b = StoredJob(**_make_job(url="https://b.com", applied=False))
+    job_a = StoredJob(**_make_job(url="https://a.com", status="applied"))
+    job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
     _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
 
     result = list_jobs(applied=True)
@@ -509,8 +509,8 @@ def test_list_jobs_applied_false_filter(tmp_path, monkeypatch):
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
 
-    job_a = StoredJob(**_make_job(url="https://a.com", applied=True))
-    job_b = StoredJob(**_make_job(url="https://b.com", applied=False))
+    job_a = StoredJob(**_make_job(url="https://a.com", status="applied"))
+    job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
     _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
 
     result = list_jobs(applied=False)
@@ -518,6 +518,34 @@ def test_list_jobs_applied_false_filter(tmp_path, monkeypatch):
     assert result.success is True
     assert result.count == 1
     assert result.jobs[0].url == "https://b.com"
+
+
+def test_list_jobs_applied_filter_counts_post_application_statuses(
+    tmp_path, monkeypatch
+):
+    """Regression: applied=True/False must not collapse the enum to == APPLIED.
+
+    interviewing/offer/rejected/withdrawn/ghosted all mean the job WAS applied
+    to. Comparing against the literal APPLIED member dropped them from
+    applied=True and resurfaced them under applied=False.
+    """
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
+
+    progressed = ["interviewing", "offer", "rejected", "withdrawn", "ghosted"]
+    jobs = [
+        StoredJob(**_make_job(url=f"https://{s}.com", status=s)) for s in progressed
+    ]
+    jobs.append(StoredJob(**_make_job(url="https://fresh.com", status="not_applied")))
+    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
+
+    applied = list_jobs(applied=True)
+    assert applied.count == len(progressed)
+    assert "https://fresh.com" not in {j.url for j in applied.jobs}
+
+    not_applied = list_jobs(applied=False)
+    assert not_applied.count == 1
+    assert not_applied.jobs[0].url == "https://fresh.com"
 
 
 def test_list_jobs_min_score_filter(tmp_path, monkeypatch):
@@ -634,7 +662,7 @@ def test_list_jobs_invalid_sort_by_returns_error(tmp_path, monkeypatch):
 
 
 def test_mark_applied_sets_applied_true(tmp_path, monkeypatch):
-    """SC-13: mark_applied → applied=True, existing notes unchanged."""
+    """SC-13: mark_applied → status="applied", existing notes unchanged."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import (
         mark_applied,
@@ -654,12 +682,12 @@ def test_mark_applied_sets_applied_true(tmp_path, monkeypatch):
 
     store = _read_jobs(path=jobs_path)
     record = store.jobs[0]
-    assert record.applied is True
+    assert record.status == "applied"
     assert record.notes == "keep me"
 
 
 def test_mark_applied_with_notes_updates_notes(tmp_path, monkeypatch):
-    """SC-14: mark_applied with notes → applied=True and notes updated."""
+    """SC-14: mark_applied with notes → status="applied" and notes updated."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import (
         mark_applied,
@@ -678,7 +706,7 @@ def test_mark_applied_with_notes_updates_notes(tmp_path, monkeypatch):
 
     store = _read_jobs(path=jobs_path)
     record = store.jobs[0]
-    assert record.applied is True
+    assert record.status == "applied"
     assert record.notes == "Applied via LinkedIn"
 
 
@@ -793,12 +821,12 @@ def test_save_job_analysis_invalid_score_returns_error(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# FIX 3: upsert must preserve `applied`
+# FIX 3: upsert must preserve `status`
 # ---------------------------------------------------------------------------
 
 
 def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
-    """FIX-3: upsert after mark_applied must NOT reset applied=False (data loss bug)."""
+    """FIX-3: upsert after mark_applied must NOT reset status=not_applied (data loss bug)."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import save_job_analysis, mark_applied, _read_jobs
 
@@ -811,7 +839,7 @@ def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
     )
     mark_applied(url="https://example.com/job/applied")
 
-    # Re-analyze same job — applied must NOT be reset
+    # Re-analyze same job — status must NOT be reset
     result = save_job_analysis(
         url="https://example.com/job/applied",
         title="Engineer",
@@ -825,7 +853,7 @@ def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
 
     store = _read_jobs(path=jobs_path)
     assert len(store.jobs) == 1
-    assert store.jobs[0].applied is True  # preserved — not reset to False
+    assert store.jobs[0].status == "applied"  # preserved — not reset to not_applied
     assert store.jobs[0].score == 90  # new analysis data is stored
 
 
@@ -889,6 +917,164 @@ def test_save_job_analysis_server_stamps_analyzed_at_freshness(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# T-11: legacy schema migration / coercion (SC-25..SC-29)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_job_dict(**overrides) -> dict:
+    """Raw dict shaped like a pre-migration (schema_version 1) job record.
+
+    Carries the old `applied: bool` field and omits `schema_version` /
+    `status` entirely, mirroring a jobs.json written before this migration.
+    """
+    base = {
+        "url": "https://example.com/job/1",
+        "title": "Software Engineer",
+        "company": "Acme Corp",
+        "visa_verdict": "GREEN",
+        "analyzed_at": "2025-06-01T00:00:00+00:00",
+        "applied": False,
+        "score": None,
+        "recommendation": None,
+        "notes": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_read_jobs_legacy_applied_true_coerces_to_status_applied(tmp_path):
+    """SC-25: legacy file (no schema_version, applied=True) coerces to status='applied'."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    payload = {"jobs": [_legacy_job_dict(applied=True)]}
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_jobs(path=jobs_path)
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0].status == "applied"
+
+
+def test_read_jobs_legacy_applied_false_coerces_to_status_not_applied(tmp_path):
+    """SC-26: legacy file (no schema_version, applied=False) coerces to status='not_applied'."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    payload = {"jobs": [_legacy_job_dict(applied=False)]}
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_jobs(path=jobs_path)
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0].status == "not_applied"
+
+
+def test_read_jobs_v2_stamped_file_still_coerces_a_legacy_record(tmp_path):
+    """Regression: a version-2 stamp must not skip a record that still has `applied`.
+
+    Hand-edited or externally-written stores can carry the current version stamp
+    with a stale record inside. Gating coercion on the top-level version let
+    pydantic drop `applied: true` as an unknown field and default the record to
+    not_applied — silent data loss on the migration path.
+    """
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    payload = {"schema_version": 2, "jobs": [_legacy_job_dict(applied=True)]}
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_jobs(path=jobs_path)
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0].status == "applied"
+
+
+def test_read_jobs_non_dict_payload_reports_corrupt(tmp_path):
+    """A JSON array/scalar at the top level is corrupt, not a crash."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    jobs_path.write_text(json.dumps([{"url": "https://a.com"}]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrupt"):
+        _read_jobs(path=jobs_path)
+
+
+def test_read_jobs_non_dict_job_record_reports_corrupt(tmp_path):
+    """A non-object inside `jobs` is corrupt rather than silently skipped."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    jobs_path.write_text(json.dumps({"jobs": ["not-a-record"]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrupt"):
+        _read_jobs(path=jobs_path)
+
+
+def test_read_jobs_migrated_file_skips_coercion(tmp_path):
+    """SC-27: a schema_version=2 file with `status` already set is used verbatim."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    job = _legacy_job_dict()
+    del job["applied"]
+    job["status"] = "interviewing"
+    payload = {"schema_version": 2, "jobs": [job]}
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_jobs(path=jobs_path)
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0].status == "interviewing"
+
+
+def test_read_jobs_legacy_coercion_is_in_memory_only(tmp_path, monkeypatch):
+    """SC-28: coercion never rewrites the file — only the next real write persists it."""
+    from tools.jobs_store import _read_jobs, save_job_analysis
+
+    jobs_path = tmp_path / "jobs.json"
+    original_payload = {
+        "jobs": [_legacy_job_dict(url="https://example.com/job/1", applied=True)]
+    }
+    original_text = json.dumps(original_payload)
+    jobs_path.write_text(original_text, encoding="utf-8")
+
+    result = _read_jobs(path=jobs_path)
+    assert result.jobs[0].status == "applied"
+    # Read-only: disk content is untouched by coercion.
+    assert jobs_path.read_text(encoding="utf-8") == original_text
+
+    _patch_jobs_path(monkeypatch, tmp_path)
+    save_job_analysis(
+        url="https://example.com/job/1",
+        title="Software Engineer",
+        company="Acme Corp",
+        visa_verdict="GREEN",
+    )
+
+    raw = json.loads(jobs_path.read_text(encoding="utf-8"))
+    assert raw.get("schema_version") == 2
+    assert "status" in raw["jobs"][0]
+    assert "applied" not in raw["jobs"][0]
+
+
+def test_read_jobs_invalid_status_value_still_raises_corrupt(tmp_path):
+    """SC-29: an uncoercible record (invalid status) still errors — no silent repair."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    job = _legacy_job_dict()
+    del job["applied"]
+    job["status"] = "bogus_status"
+    payload = {"schema_version": 2, "jobs": [job]}
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="(?i)corrupt"):
+        _read_jobs(path=jobs_path)
+
+
+# ---------------------------------------------------------------------------
 # FIX 7: combined FILTER → SORT → LIMIT pipeline test
 # ---------------------------------------------------------------------------
 
@@ -898,13 +1084,13 @@ def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
 
-    # Jobs: varying analyzed_at, applied, score
+    # Jobs: varying analyzed_at, status, score
     job_old_low = StoredJob(
         **_make_job(
             url="https://old-low.com",
             analyzed_at="2024-01-01T00:00:00+00:00",
             score=40,
-            applied=False,
+            status="not_applied",
         )
     )
     job_new_low = StoredJob(
@@ -912,7 +1098,7 @@ def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
             url="https://new-low.com",
             analyzed_at="2025-06-01T00:00:00+00:00",
             score=50,
-            applied=False,
+            status="not_applied",
         )
     )
     job_new_high_a = StoredJob(
@@ -920,7 +1106,7 @@ def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
             url="https://new-high-a.com",
             analyzed_at="2025-06-02T00:00:00+00:00",
             score=85,
-            applied=False,
+            status="not_applied",
         )
     )
     job_new_high_b = StoredJob(
@@ -928,7 +1114,7 @@ def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
             url="https://new-high-b.com",
             analyzed_at="2025-06-03T00:00:00+00:00",
             score=95,
-            applied=True,
+            status="applied",
         )
     )
     _write_jobs(

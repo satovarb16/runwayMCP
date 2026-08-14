@@ -138,7 +138,7 @@ async def main() -> None:
 
             # Assertion summary for P2 (the headline feature)
             j1_still_applied = any(
-                j.get("url") == J1 and j.get("applied") is True
+                j.get("url") == J1 and j.get("status") == "applied"
                 for j in applied_after.get("jobs", [])
             )
             print(f"\n# P2 CHECK — J1 still applied after re-save: {j1_still_applied}")
