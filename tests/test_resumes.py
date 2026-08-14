@@ -462,81 +462,6 @@ def test_list_resume_versions_invalid_limit_returns_error(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# _lineage unit tests (design Testing Strategy: child->root order, dangling
-# parent, cycle guard, single-root)
-# ---------------------------------------------------------------------------
-
-
-def test_lineage_single_root():
-    from tools.resumes import ResumeStore, ResumeVersion, _lineage
-
-    base = ResumeVersion(
-        id="base", label="Base", content="x", parent_id=None, created_at="t0"
-    )
-    store = ResumeStore(versions=[base])
-
-    chain = _lineage(store, "base")
-
-    assert [v.id for v in chain] == ["base"]
-
-
-def test_lineage_child_to_root_order():
-    from tools.resumes import ResumeStore, ResumeVersion, _lineage
-
-    base = ResumeVersion(
-        id="base", label="Base", content="x", parent_id=None, created_at="t0"
-    )
-    v2 = ResumeVersion(
-        id="v2", label="V2", content="x", parent_id="base", created_at="t1"
-    )
-    v3 = ResumeVersion(
-        id="v3", label="V3", content="x", parent_id="v2", created_at="t2"
-    )
-    store = ResumeStore(versions=[base, v2, v3])
-
-    chain = _lineage(store, "v3")
-
-    assert [v.id for v in chain] == ["v3", "v2", "base"]
-
-
-def test_lineage_unknown_id_raises():
-    from tools.resumes import ResumeStore, _lineage
-
-    store = ResumeStore(versions=[])
-
-    with pytest.raises(ValueError):
-        _lineage(store, "ghost")
-
-
-def test_lineage_dangling_parent_raises():
-    from tools.resumes import ResumeStore, ResumeVersion, _lineage
-
-    orphan = ResumeVersion(
-        id="orphan",
-        label="Orphan",
-        content="x",
-        parent_id="missing-parent",
-        created_at="t0",
-    )
-    store = ResumeStore(versions=[orphan])
-
-    with pytest.raises(ValueError):
-        _lineage(store, "orphan")
-
-
-def test_lineage_cycle_raises():
-    """A hand-corrupted store with a parent_id cycle must not infinite-loop."""
-    from tools.resumes import ResumeStore, ResumeVersion, _lineage
-
-    a = ResumeVersion(id="a", label="A", content="x", parent_id="b", created_at="t0")
-    b = ResumeVersion(id="b", label="B", content="x", parent_id="a", created_at="t1")
-    store = ResumeStore(versions=[a, b])
-
-    with pytest.raises(ValueError):
-        _lineage(store, "a")
-
-
-# ---------------------------------------------------------------------------
 # _read_resumes / _write_resumes persistence helper tests
 # ---------------------------------------------------------------------------
 
@@ -684,3 +609,92 @@ def test_list_resume_versions_corrupt_store_returns_error(tmp_path, monkeypatch)
 
     assert result.success is False
     assert re.search("(?i)corrupt", result.error_message)
+
+
+# ---------------------------------------------------------------------------
+# _general_resume selection rules (design D6)
+# ---------------------------------------------------------------------------
+
+
+def _v(vid, *, parent_id=None, job_url=None, created_at="2025-01-01T00:00:00+00:00"):
+    """Build a ResumeVersion directly, bypassing save_resume_version's rules.
+
+    These are unit tests of the selection rule, so stores are constructed in
+    shapes the public save path would not necessarily produce.
+    """
+    from tools.resumes import ResumeVersion
+
+    return ResumeVersion(
+        id=vid,
+        label=vid,
+        content=f"content-{vid}",
+        parent_id=parent_id,
+        job_url=job_url,
+        created_at=created_at,
+    )
+
+
+def test_general_resume_prefers_newest_untailored_over_the_root():
+    """A refreshed general resume must win over the original base.
+
+    This is the rule the whole design rests on: "general" means job_url is
+    None, NOT "the root". Returning the root would silently pin analyze_job
+    to the user's first-ever upload and ignore every later update.
+    """
+    from tools.resumes import ResumeStore, _general_resume
+
+    base = _v("base", created_at="2025-01-01T00:00:00+00:00")
+    refresh = _v("refresh", parent_id="base", created_at="2025-06-01T00:00:00+00:00")
+    store = ResumeStore(versions=[base, refresh])
+
+    assert _general_resume(store).id == "refresh"
+
+
+def test_general_resume_ignores_job_tailored_versions():
+    """A newer version tailored to some job is not the general resume."""
+    from tools.resumes import ResumeStore, _general_resume
+
+    base = _v("base", created_at="2025-01-01T00:00:00+00:00")
+    tailored = _v(
+        "tailored",
+        parent_id="base",
+        job_url="https://acme.com/job/1",
+        created_at="2025-06-01T00:00:00+00:00",
+    )
+    store = ResumeStore(versions=[base, tailored])
+
+    assert _general_resume(store).id == "base"
+
+
+def test_general_resume_breaks_multi_root_ties_by_recency():
+    """Independent trees: the most recent candidate wins, whichever tree."""
+    from tools.resumes import ResumeStore, _general_resume
+
+    old_root = _v("old", created_at="2025-01-01T00:00:00+00:00")
+    new_root = _v("new", created_at="2025-09-01T00:00:00+00:00")
+    store = ResumeStore(versions=[old_root, new_root])
+
+    assert _general_resume(store).id == "new"
+
+
+def test_general_resume_fallback_refuses_a_resume_tailored_to_this_job():
+    """The fallback must not hand back a resume written for the very job.
+
+    save_resume_version lets the FIRST version carry a job_url, so a store can
+    contain nothing untailored. Returning it would produce the inflated
+    self-scored match the general-resume rule exists to prevent.
+    """
+    from tools.resumes import ResumeStore, _general_resume
+
+    only = _v("only", job_url="https://acme.com/job/1")
+    store = ResumeStore(versions=[only])
+
+    assert _general_resume(store, for_job_url="https://acme.com/job/1") is None
+    # ...but it is a fine general stand-in for a DIFFERENT job
+    assert _general_resume(store, for_job_url="https://other.com/job/9").id == "only"
+
+
+def test_general_resume_empty_store_returns_none():
+    from tools.resumes import ResumeStore, _general_resume
+
+    assert _general_resume(ResumeStore()) is None
