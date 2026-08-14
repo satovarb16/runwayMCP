@@ -181,48 +181,69 @@ def _write_resumes(store: ResumeStore, path: Path | None = None) -> None:
     _storage.atomic_write_json(store, resolved, tmp_prefix=".resumes_tmp_")
 
 
-def _lineage(store: ResumeStore, version_id: str) -> list[ResumeVersion]:
-    """Walk the parent_id chain from a version up to the root (child->root order).
+def _general_resume(
+    store: ResumeStore, for_job_url: str | None = None
+) -> ResumeVersion | None:
+    """Select the GENERAL (non-job-tailored) resume for analyze_job (design D6).
 
-    Not called by any tool in this module yet: its consumer is PR5, where
-    analyze_job must inject the ROOT (general) resume rather than the latest
-    tailored one, so a job-match score is not inflated by scoring a resume
-    that was already tailored to that job. Kept here rather than deferred
-    because that is the lineage primitive this store exists to provide.
+    "General" means not written for any particular job, which is exactly
+    `job_url is None` — not "the root". Those differ once a user refreshes
+    their general resume, and the distinction matters:
+
+    1. Among versions with `job_url is None`, return the most recently
+       created one. Usually that is the base itself, but a user who updates
+       their general resume must save it as a new version with
+       `parent_id=<existing id>` (save_resume_version forbids a second
+       `parent_id=None` once a base exists, SC-03/SC-04). Returning the root
+       instead would hand analyze_job the original text forever and silently
+       ignore every update.
+    2. Fallback, reachable only if no stored version has `job_url=None` —
+       every version, including the first, was saved against some job:
+       return the most recently created root.
+
+    The property both branches must preserve is that the returned resume was
+    never written for the job being analyzed — scoring a job against a resume
+    already rewritten for that job is scoring it against itself. Branch 1 gets
+    that for free. Branch 2 does not: the base is allowed to carry a job_url,
+    so `for_job_url` is excluded explicitly there. If that leaves nothing,
+    return None and let the caller report no_resume, which is honest, rather
+    than hand back a resume known to be tailored to this exact posting.
+
+    With several independent trees (roots sharing no common ancestor, e.g.
+    the user started an unrelated second base), recency alone decides. That
+    keeps this a single total order over created_at instead of requiring a
+    notion of "the active tree", which neither spec nor design defines.
+
+    Caller contract: a version written FOR a job must be saved with that
+    job_url. Nothing server-side can enforce it — requiring job_url whenever
+    parent_id is set would forbid the general-resume refresh above, which is
+    the same shape. A tailored version saved without a job_url becomes the
+    newest untailored one and is returned as "general" until corrected. That
+    is recoverable with the same tool and no file surgery: save the real
+    general text again with job_url=None and it wins on recency.
 
     Args:
-        store:      The ResumeStore to walk.
-        version_id: The id of the version to start the walk from (included as
-                    the first element of the returned chain).
+        store:       The ResumeStore to select from.
+        for_job_url: The job URL about to be analyzed, so branch 2 can refuse
+                     a resume tailored to it. None disables that exclusion.
 
     Returns:
-        A list of ResumeVersion ordered from `version_id` (index 0) up to the
-        root/base version (parent_id=None) at the end.
-
-    Raises:
-        ValueError: if `version_id` does not exist in the store, if a parent
-                    reference along the chain is dangling (points at a
-                    missing id), or if a cycle is detected (defensive guard
-                    against a hand-corrupted store — save_resume_version
-                    itself never creates a cycle).
+        The selected ResumeVersion, or None when nothing usable exists
+        (analyze_job maps None to error="no_resume").
     """
-    by_id = {v.id: v for v in store.versions}
-    if version_id not in by_id:
-        raise ValueError(f"Unknown resume version id: {version_id!r}")
+    general_candidates = [v for v in store.versions if v.job_url is None]
+    if general_candidates:
+        return max(general_candidates, key=lambda v: v.created_at)
 
-    chain: list[ResumeVersion] = []
-    seen: set[str] = set()
-    current_id: str | None = version_id
-    while current_id is not None:
-        if current_id in seen:
-            raise ValueError(f"Cycle detected in resume lineage at id: {current_id!r}")
-        seen.add(current_id)
-        version = by_id.get(current_id)
-        if version is None:
-            raise ValueError(f"Dangling parent_id reference: {current_id!r} not found")
-        chain.append(version)
-        current_id = version.parent_id
-    return chain
+    root_candidates = [
+        v
+        for v in store.versions
+        if v.parent_id is None and (for_job_url is None or v.job_url != for_job_url)
+    ]
+    if root_candidates:
+        return max(root_candidates, key=lambda v: v.created_at)
+
+    return None
 
 
 # ---------------------------------------------------------------------------

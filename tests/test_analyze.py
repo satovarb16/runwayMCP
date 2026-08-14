@@ -1,6 +1,6 @@
 """Tests for tools/analyze.py — analyze_job orchestrator (Option A).
 
-analyze_job gathers FACTS (job, visa, profile) + a scoring guide. The match
+analyze_job gathers FACTS (job, visa, resume) + a scoring guide. The match
 score and APPLY/CONSIDER/SKIP recommendation are produced by the
 conversation-side Claude, NOT the server — so this suite asserts the envelope
 contents, not a server-computed score/recommendation.
@@ -12,7 +12,7 @@ import pytest
 
 from tools.jobs import JobPostingResult
 from tools.visa import VisaResult, Verdict
-from tools.profile import ProfileData
+from tools.resumes import ResumeStore, ResumeVersion
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +45,26 @@ def _make_visa_result(
     )
 
 
-def _make_profile() -> ProfileData:
-    return ProfileData(name="Jane Doe", skills=["Python"])
+def _make_resume(
+    id: str = "base-1",
+    label: str = "Base",
+    content: str = "Jane Doe — Python engineer",
+    parent_id: str | None = None,
+    job_url: str | None = None,
+    created_at: str = "2026-01-01T00:00:00+00:00",
+) -> ResumeVersion:
+    return ResumeVersion(
+        id=id,
+        label=label,
+        content=content,
+        parent_id=parent_id,
+        job_url=job_url,
+        created_at=created_at,
+    )
+
+
+def _make_resume_store(*versions: ResumeVersion) -> ResumeStore:
+    return ResumeStore(versions=list(versions))
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +111,7 @@ class TestPydanticModels:
         result = AnalyzeJobResult()
         assert result.job is None
         assert result.visa is None
-        assert result.profile is None
+        assert result.resume is None
         assert result.scoring_guide is None
         assert result.error is None
         assert result.message is None
@@ -107,6 +125,16 @@ class TestPydanticModels:
         assert not hasattr(result, "recommendation"), (
             "Server must NOT compute a recommendation"
         )
+
+    def test_analyze_job_result_profile_field_renamed_to_resume(self):
+        """PR5: the envelope field is `resume`, `profile` must be gone."""
+        from tools.analyze import AnalyzeJobResult
+
+        result = AnalyzeJobResult()
+        assert not hasattr(result, "profile"), (
+            "`profile` field must be renamed to `resume`"
+        )
+        assert hasattr(result, "resume")
 
     def test_analyze_job_result_no_confidence_field(self):
         from tools.analyze import AnalyzeJobResult, VisaSummary
@@ -200,8 +228,9 @@ class TestAnalyzeJobHappyPath:
     async def test_happy_path_returns_facts_and_guide(self, monkeypatch):
         from tools import analyze as analyze_mod
 
-        profile = _make_profile()
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: profile)
+        base = _make_resume()
+        store = _make_resume_store(base)
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
         monkeypatch.setattr(
             analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
@@ -224,8 +253,8 @@ class TestAnalyzeJobHappyPath:
         assert result.visa.verdict == "GREEN"
         assert result.visa.filings == 15
         assert result.visa.approval_rate == 0.92
-        assert result.profile is not None
-        assert result.profile.name == "Jane Doe"
+        assert result.resume is not None
+        assert result.resume.id == base.id
         assert result.scoring_guide is not None
         assert len(result.scoring_guide.recommendation_rules) >= 3
 
@@ -234,7 +263,8 @@ class TestAnalyzeJobHappyPath:
         """analyze_job must NEVER raise — all failures returned in envelope."""
         from tools import analyze as analyze_mod
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
+        store = _make_resume_store(_make_resume())
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
         monkeypatch.setattr(
             analyze_mod,
             "fetch_job_posting",
@@ -259,7 +289,8 @@ class TestFailurePaths:
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
+        store = _make_resume_store(_make_resume())
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
 
         visa_spy = MM(side_effect=lambda company: _make_visa_result())
         monkeypatch.setattr(
@@ -282,10 +313,11 @@ class TestFailurePaths:
 
     @pytest.mark.asyncio
     async def test_visa_fails_continues_with_unknown(self, monkeypatch):
-        """visa raises → UNKNOWN verdict, envelope still returns job/profile/guide."""
+        """visa raises → UNKNOWN verdict, envelope still returns job/resume/guide."""
         from tools import analyze as analyze_mod
 
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: _make_profile())
+        store = _make_resume_store(_make_resume())
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
         monkeypatch.setattr(
             analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
         )
@@ -302,52 +334,55 @@ class TestFailurePaths:
         assert result.visa.verdict == "UNKNOWN"
         assert result.visa.error is not None
         assert result.job is not None
-        assert result.profile is not None
+        assert result.resume is not None
         assert result.scoring_guide is not None
 
 
 # ---------------------------------------------------------------------------
-# T-06: Profile precondition
+# T-06: Resume precondition — SC-13, SC-14
 # ---------------------------------------------------------------------------
 
 
-class TestProfilePrecondition:
+class TestResumePrecondition:
     @pytest.mark.asyncio
-    async def test_no_profile_file_not_found_error(self, monkeypatch):
+    async def test_sc14_empty_store_no_resume_error_before_fetch(self, monkeypatch):
+        """SC-14: empty resume store → error='no_resume' BEFORE the job fetch."""
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
         fetch_spy = MM(side_effect=lambda url: _make_job_result())
-        monkeypatch.setattr(
-            analyze_mod,
-            "_read_profile",
-            lambda: (_ for _ in ()).throw(FileNotFoundError("no profile")),
-        )
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: _make_resume_store())
         monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
 
         from tools.analyze import analyze_job
 
         result = await analyze_job("https://example.com/job/123")
 
-        assert result.error == "no_profile"
-        assert "setup_profile" in result.message
+        assert result.error == "no_resume"
+        assert result.message is not None
         assert result.job is None
         assert result.visa is None
-        assert result.profile is None
+        assert result.resume is None
         assert result.scoring_guide is None
         fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_profile_value_error(self, monkeypatch):
+    async def test_corrupt_store_is_not_reported_as_no_resume(self, monkeypatch):
+        """A broken store must not be reported as "you have no resume yet".
+
+        That advice sends the user to save_resume_version, which fails on the
+        same file for the same reason. no_resume means the store is readable
+        and holds nothing usable; corrupt means the file itself is the problem.
+        """
         from tools import analyze as analyze_mod
         from unittest.mock import MagicMock as MM
 
         fetch_spy = MM(side_effect=lambda url: _make_job_result())
         monkeypatch.setattr(
             analyze_mod,
-            "_read_profile",
+            "_read_resumes",
             lambda: (_ for _ in ()).throw(
-                ValueError("No profile found. Run setup_profile first.")
+                ValueError("Resume store is corrupt: bad json")
             ),
         )
         monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
@@ -356,26 +391,45 @@ class TestProfilePrecondition:
 
         result = await analyze_job("https://example.com/job/123")
 
-        assert result.error == "no_profile"
-        assert "setup_profile" in result.message
+        assert result.error == "corrupt"
+        assert "corrupt" in result.message
         fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_profile_returns_none(self, monkeypatch):
+    async def test_sc13_envelope_carries_base_resume_not_tailored_child(
+        self, monkeypatch
+    ):
+        """SC-13: with a base + a job-tailored child, the envelope carries the
+        BASE (root) resume, never the tailored child."""
         from tools import analyze as analyze_mod
-        from unittest.mock import MagicMock as MM
 
-        fetch_spy = MM(side_effect=lambda url: _make_job_result())
-        monkeypatch.setattr(analyze_mod, "_read_profile", lambda: None)
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
+        base = _make_resume(
+            id="base-1", job_url=None, created_at="2026-01-01T00:00:00+00:00"
+        )
+        tailored_child = _make_resume(
+            id="child-1",
+            label="Tailored for Acme",
+            parent_id="base-1",
+            job_url="https://example.com/job/123",
+            created_at="2026-02-01T00:00:00+00:00",
+        )
+        store = _make_resume_store(base, tailored_child)
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
+        monkeypatch.setattr(
+            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
+        )
+        monkeypatch.setattr(
+            analyze_mod, "check_visa_sponsorship", lambda company: _make_visa_result()
+        )
 
         from tools.analyze import analyze_job
 
         result = await analyze_job("https://example.com/job/123")
 
-        assert result.error == "no_profile"
-        assert result.job is None
-        fetch_spy.assert_not_called()
+        assert result.error is None
+        assert result.resume is not None
+        assert result.resume.id == base.id
+        assert result.resume.id != tailored_child.id
 
 
 # ---------------------------------------------------------------------------
