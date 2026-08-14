@@ -132,16 +132,36 @@ def test_list_jobs_result_shape():
 
 
 @pytest.mark.contract
-def test_mark_applied_result_shape():
-    """MarkAppliedResult exposes the documented field names and defaults."""
-    from tools.jobs_store import MarkAppliedResult
+def test_set_status_result_shape():
+    """SetStatusResult exposes the documented field names and defaults (SC-18)."""
+    from tools.jobs_store import SetStatusResult
 
-    result = MarkAppliedResult(success=False, error="not_found")
+    result = SetStatusResult(success=False, error="not_found")
 
     assert result.success is False
     assert result.error == "not_found"
     assert result.url is None
+    assert result.status is None
+    assert result.previous_status is None
     assert result.message is None
+
+
+@pytest.mark.contract
+def test_application_status_has_exactly_seven_values():
+    """SC-18: exactly these 7 string values are valid application statuses."""
+    from tools.jobs_store import ApplicationStatus
+
+    values = {member.value for member in ApplicationStatus}
+
+    assert values == {
+        "not_applied",
+        "applied",
+        "interviewing",
+        "offer",
+        "rejected",
+        "withdrawn",
+        "ghosted",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +508,8 @@ def test_list_jobs_since_filter(tmp_path, monkeypatch):
     assert result.jobs[0].url == "https://b.com"
 
 
-def test_list_jobs_applied_true_filter(tmp_path, monkeypatch):
-    """SC-08: applied=True returns only applied jobs."""
+def test_list_jobs_status_filter_exact_match(tmp_path, monkeypatch):
+    """SC-24: status='applied' returns only the job with that exact status."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
 
@@ -497,15 +517,34 @@ def test_list_jobs_applied_true_filter(tmp_path, monkeypatch):
     job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
     _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
 
-    result = list_jobs(applied=True)
+    result = list_jobs(status="applied")
 
     assert result.success is True
     assert result.count == 1
     assert result.jobs[0].url == "https://a.com"
 
 
-def test_list_jobs_applied_false_filter(tmp_path, monkeypatch):
-    """SC-09: applied=False returns only non-applied jobs."""
+def test_list_jobs_status_filter_is_exact_not_grouped(tmp_path, monkeypatch):
+    """SC-24: status filter is an exact match — 'interviewing' does NOT also
+    match 'applied' or other post-application statuses (unlike the old
+    boolean `applied` filter, which grouped every non-not_applied status)."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
+
+    statuses = ["applied", "interviewing", "offer", "rejected", "withdrawn", "ghosted"]
+    jobs = [StoredJob(**_make_job(url=f"https://{s}.com", status=s)) for s in statuses]
+    jobs.append(StoredJob(**_make_job(url="https://fresh.com", status="not_applied")))
+    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
+
+    result = list_jobs(status="interviewing")
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].url == "https://interviewing.com"
+
+
+def test_list_jobs_status_none_returns_all(tmp_path, monkeypatch):
+    """SC-24: status=None (default) returns every record, unfiltered."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
 
@@ -513,39 +552,24 @@ def test_list_jobs_applied_false_filter(tmp_path, monkeypatch):
     job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
     _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
 
-    result = list_jobs(applied=False)
+    result = list_jobs(status=None)
 
     assert result.success is True
-    assert result.count == 1
-    assert result.jobs[0].url == "https://b.com"
+    assert result.count == 2
 
 
-def test_list_jobs_applied_filter_counts_post_application_statuses(
-    tmp_path, monkeypatch
-):
-    """Regression: applied=True/False must not collapse the enum to == APPLIED.
-
-    interviewing/offer/rejected/withdrawn/ghosted all mean the job WAS applied
-    to. Comparing against the literal APPLIED member dropped them from
-    applied=True and resurfaced them under applied=False.
-    """
+def test_list_jobs_invalid_status_returns_error(tmp_path, monkeypatch):
+    """Unknown status value → success=False, error_message (mirrors sort_by guard)."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
+    from tools.jobs_store import list_jobs, _write_jobs, JobStore
 
-    progressed = ["interviewing", "offer", "rejected", "withdrawn", "ghosted"]
-    jobs = [
-        StoredJob(**_make_job(url=f"https://{s}.com", status=s)) for s in progressed
-    ]
-    jobs.append(StoredJob(**_make_job(url="https://fresh.com", status="not_applied")))
-    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
+    _write_jobs(JobStore(jobs=[]), path=jobs_path)
 
-    applied = list_jobs(applied=True)
-    assert applied.count == len(progressed)
-    assert "https://fresh.com" not in {j.url for j in applied.jobs}
+    result = list_jobs(status="bogus_status")
 
-    not_applied = list_jobs(applied=False)
-    assert not_applied.count == 1
-    assert not_applied.jobs[0].url == "https://fresh.com"
+    assert result.success is False
+    assert result.error_message is not None
+    assert "bogus_status" in result.error_message
 
 
 def test_list_jobs_min_score_filter(tmp_path, monkeypatch):
@@ -657,15 +681,15 @@ def test_list_jobs_invalid_sort_by_returns_error(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# T-09 / T-10: mark_applied (SC-13, SC-14, SC-15)
+# T-09 / T-10: set_application_status (SC-19..SC-23) and mark_applied removal (SC-30)
 # ---------------------------------------------------------------------------
 
 
-def test_mark_applied_sets_applied_true(tmp_path, monkeypatch):
-    """SC-13: mark_applied → status="applied", existing notes unchanged."""
+def test_set_application_status_valid_forward_transition(tmp_path, monkeypatch):
+    """SC-19: not_applied -> applied succeeds, stored status updated."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import (
-        mark_applied,
+        set_application_status,
         _write_jobs,
         _read_jobs,
         JobStore,
@@ -675,10 +699,11 @@ def test_mark_applied_sets_applied_true(tmp_path, monkeypatch):
     job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
     _write_jobs(JobStore(jobs=[job]), path=jobs_path)
 
-    result = mark_applied(url="https://example.com/job/1")
+    result = set_application_status(url="https://example.com/job/1", status="applied")
 
     assert result.success is True
     assert result.url == "https://example.com/job/1"
+    assert result.status == "applied"
 
     store = _read_jobs(path=jobs_path)
     record = store.jobs[0]
@@ -686,38 +711,71 @@ def test_mark_applied_sets_applied_true(tmp_path, monkeypatch):
     assert record.notes == "keep me"
 
 
-def test_mark_applied_with_notes_updates_notes(tmp_path, monkeypatch):
-    """SC-14: mark_applied with notes → status="applied" and notes updated."""
+def test_set_application_status_free_transition_rejected_to_interviewing(
+    tmp_path, monkeypatch
+):
+    """SC-20: any->any transition is allowed — rejected -> interviewing succeeds
+    with no state-machine restriction."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     from tools.jobs_store import (
-        mark_applied,
+        set_application_status,
         _write_jobs,
         _read_jobs,
         JobStore,
         StoredJob,
     )
 
-    job = StoredJob(**_make_job(url="https://example.com/job/1"))
+    job = StoredJob(**_make_job(url="https://example.com/job/1", status="rejected"))
     _write_jobs(JobStore(jobs=[job]), path=jobs_path)
 
-    result = mark_applied(url="https://example.com/job/1", notes="Applied via LinkedIn")
+    result = set_application_status(
+        url="https://example.com/job/1", status="interviewing"
+    )
 
     assert result.success is True
+    assert result.status == "interviewing"
 
     store = _read_jobs(path=jobs_path)
-    record = store.jobs[0]
-    assert record.status == "applied"
-    assert record.notes == "Applied via LinkedIn"
+    assert store.jobs[0].status == "interviewing"
 
 
-def test_mark_applied_unknown_url_returns_not_found(tmp_path, monkeypatch):
-    """SC-15: mark_applied on unknown url → success=False, error='not_found', no phantom."""
+def test_set_application_status_invalid_status_rejected(tmp_path, monkeypatch):
+    """SC-21: unknown status string -> success=False, error='invalid_status';
+    the stored record is unchanged."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import mark_applied, _write_jobs, _read_jobs, JobStore
+    from tools.jobs_store import (
+        set_application_status,
+        _write_jobs,
+        _read_jobs,
+        JobStore,
+        StoredJob,
+    )
+
+    job = StoredJob(**_make_job(url="https://example.com/job/1", status="applied"))
+    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
+
+    result = set_application_status(url="https://example.com/job/1", status="bogus")
+
+    assert result.success is False
+    assert result.error == "invalid_status"
+
+    store = _read_jobs(path=jobs_path)
+    assert store.jobs[0].status == "applied"  # unchanged
+
+
+def test_set_application_status_unknown_url_returns_not_found(tmp_path, monkeypatch):
+    """SC-22: unknown url -> success=False, error='not_found', no phantom record."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import (
+        set_application_status,
+        _write_jobs,
+        _read_jobs,
+        JobStore,
+    )
 
     _write_jobs(JobStore(jobs=[]), path=jobs_path)
 
-    result = mark_applied(url="https://example.com/missing")
+    result = set_application_status(url="https://example.com/missing", status="applied")
 
     assert result.success is False
     assert result.error == "not_found"
@@ -726,17 +784,72 @@ def test_mark_applied_unknown_url_returns_not_found(tmp_path, monkeypatch):
     assert len(store.jobs) == 0
 
 
-def test_mark_applied_corrupt_store_returns_error(tmp_path, monkeypatch):
-    """mark_applied on corrupt store → success=False with error info."""
+def test_set_application_status_no_notes_preserves_existing(tmp_path, monkeypatch):
+    """SC-23: no notes argument -> existing notes are preserved."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import (
+        set_application_status,
+        _write_jobs,
+        _read_jobs,
+        JobStore,
+        StoredJob,
+    )
+
+    job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
+    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
+
+    result = set_application_status(
+        url="https://example.com/job/1", status="interviewing"
+    )
+
+    assert result.success is True
+    store = _read_jobs(path=jobs_path)
+    assert store.jobs[0].notes == "keep me"
+
+
+def test_set_application_status_with_notes_replaces_existing(tmp_path, monkeypatch):
+    """SC-23: notes argument provided -> notes is replaced."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import (
+        set_application_status,
+        _write_jobs,
+        _read_jobs,
+        JobStore,
+        StoredJob,
+    )
+
+    job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
+    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
+
+    result = set_application_status(
+        url="https://example.com/job/1", status="interviewing", notes="update"
+    )
+
+    assert result.success is True
+    store = _read_jobs(path=jobs_path)
+    assert store.jobs[0].notes == "update"
+
+
+def test_set_application_status_corrupt_store_returns_error(tmp_path, monkeypatch):
+    """set_application_status on corrupt store -> success=False with error info."""
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
     jobs_path.write_text("not{json", encoding="utf-8")
-    from tools.jobs_store import mark_applied
+    from tools.jobs_store import set_application_status
 
-    result = mark_applied(url="https://example.com/job/1")
+    result = set_application_status(url="https://example.com/job/1", status="applied")
 
     assert result.success is False
     # error or message should be populated
     assert result.error is not None or result.message is not None
+
+
+def test_mark_applied_no_longer_exists():
+    """SC-30: mark_applied is absent, not deprecated — not importable from
+    tools.jobs_store."""
+    import tools.jobs_store as jobs_store_mod
+
+    assert not hasattr(jobs_store_mod, "mark_applied")
+    assert not hasattr(jobs_store_mod, "MarkAppliedResult")
 
 
 # ---------------------------------------------------------------------------
@@ -825,10 +938,75 @@ def test_save_job_analysis_invalid_score_returns_error(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
-    """FIX-3: upsert after mark_applied must NOT reset status=not_applied (data loss bug)."""
+def test_save_job_analysis_upsert_preserves_notes(tmp_path, monkeypatch):
+    """Re-analyzing a reposted listing must not wipe application-tracking notes."""
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
+
+    url = "https://example.com/job/notes"
+    save_job_analysis(
+        url=url, title="Engineer", company="Acme", visa_verdict="GREEN", score=70
+    )
+    set_application_status(url=url, status="interviewing", notes="phone screen 6/12")
+
+    save_job_analysis(
+        url=url, title="Engineer (reposted)", company="Acme", visa_verdict="GREEN"
+    )
+
+    record = _read_jobs().jobs[0]
+    assert record.notes == "phone screen 6/12"
+    assert record.status == "interviewing"
+
+
+def test_save_job_analysis_explicit_notes_overwrite_existing(tmp_path, monkeypatch):
+    """An explicit notes argument still wins over the preserved value."""
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
+
+    url = "https://example.com/job/notes2"
+    save_job_analysis(url=url, title="Engineer", company="Acme", visa_verdict="GREEN")
+    set_application_status(url=url, status="applied", notes="old note")
+
+    save_job_analysis(
+        url=url,
+        title="Engineer",
+        company="Acme",
+        visa_verdict="GREEN",
+        notes="new note",
+    )
+
+    assert _read_jobs().jobs[0].notes == "new note"
+
+
+def test_tools_return_error_envelope_when_store_unreadable(tmp_path, monkeypatch):
+    """An OSError on read must not escape to the MCP boundary as a traceback.
+
+    _read_jobs calls read_text(), which raises IsADirectoryError/PermissionError
+    when the store path is not a readable file. Callers only catch ValueError,
+    so the OSError has to be wrapped rather than propagated.
+    """
     jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, mark_applied, _read_jobs
+    jobs_path.mkdir()  # a directory where a file is expected
+    from tools.jobs_store import save_job_analysis, list_jobs, set_application_status
+
+    listed = list_jobs()
+    assert listed.success is False
+    assert "unreadable" in listed.error_message
+
+    status_set = set_application_status(url="https://example.com/x", status="applied")
+    assert status_set.success is False
+
+    saved = save_job_analysis(
+        url="https://example.com/x", title="T", company="C", visa_verdict="GREEN"
+    )
+    assert saved.success is False
+
+
+def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
+    """FIX-3: upsert after set_application_status must NOT reset status=not_applied
+    (data loss bug)."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
 
     save_job_analysis(
         url="https://example.com/job/applied",
@@ -837,7 +1015,7 @@ def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
         visa_verdict="GREEN",
         score=70,
     )
-    mark_applied(url="https://example.com/job/applied")
+    set_application_status(url="https://example.com/job/applied", status="applied")
 
     # Re-analyze same job — status must NOT be reset
     result = save_job_analysis(

@@ -65,7 +65,7 @@ async def main() -> None:
             tools = await session.list_tools()
             names = sorted(t.name for t in tools.tools)
             print(f"\n# Registered tools ({len(names)}): {names}")
-            for t in ("save_job_analysis", "list_jobs", "mark_applied"):
+            for t in ("save_job_analysis", "list_jobs", "set_application_status"):
                 assert t in names, f"MISSING TOOL: {t}"
 
             # --- Happy path ---
@@ -102,8 +102,14 @@ async def main() -> None:
                 session, "list_jobs", sort_by="score"
             )  # expect J1, J2, then J3(None last)
 
-            await call(session, "mark_applied", url=J1, notes="applied via referral")
-            await call(session, "list_jobs", applied=True)  # expect only J1
+            await call(
+                session,
+                "set_application_status",
+                url=J1,
+                status="applied",
+                notes="applied via referral",
+            )
+            await call(session, "list_jobs", status="applied")  # expect only J1
 
             # --- PROBES (the bugs judgment-day fixed) ---
             print("\n# ===== PROBES =====")
@@ -117,7 +123,7 @@ async def main() -> None:
                 visa_verdict="GREEN",
                 score=85.5,
             )
-            # P2: upsert must PRESERVE applied=True on the already-applied J1
+            # P2: upsert must PRESERVE status="applied" on the already-applied J1
             await call(
                 session,
                 "save_job_analysis",
@@ -128,13 +134,18 @@ async def main() -> None:
                 score=90,
                 recommendation="APPLY",
             )
-            applied_after = await call(session, "list_jobs", applied=True)
+            applied_after = await call(session, "list_jobs", status="applied")
             # P3: since with Z suffix, inclusive
             await call(session, "list_jobs", since="2000-01-01T00:00:00Z")  # expect all
             # P4: limit=0 -> error envelope, not silent empty
             await call(session, "list_jobs", limit=0)
-            # P5: mark_applied unknown url -> not_found
-            await call(session, "mark_applied", url="https://x.com/nope")
+            # P5: set_application_status unknown url -> not_found
+            await call(
+                session,
+                "set_application_status",
+                url="https://x.com/nope",
+                status="applied",
+            )
 
             # Assertion summary for P2 (the headline feature)
             j1_still_applied = any(
