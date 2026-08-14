@@ -81,6 +81,17 @@ def test_jobs_store_tools_registered():
     assert "mark_applied" not in registered_names
 
 
+@pytest.mark.integration
+def test_resume_tools_registered():
+    """save_resume_version, get_resume_version, list_resume_versions must be
+    registered in the FastMCP instance (PR4, Phase B)."""
+    tool_manager = server.mcp._tool_manager
+    registered_names = set(tool_manager._tools.keys())
+    assert "save_resume_version" in registered_names
+    assert "get_resume_version" in registered_names
+    assert "list_resume_versions" in registered_names
+
+
 def test_sc07_refresh_called_at_startup(monkeypatch):
     """SC-07: refresh_to_latest_fy() must be called exactly once when server.py
     is imported (module-level startup block), after all mcp.tool() registrations."""
