@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [master]
+  # No branch filter: on.pull_request.branches matches the PR's BASE branch, so
+  # [master] silently skipped every PR in a stacked/chained series targeting a
+  # tracker branch. Those PRs merged with no lint run and no test matrix.
   pull_request:
-    branches: [master]
 
 jobs:
   lint:
