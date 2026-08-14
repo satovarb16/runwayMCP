@@ -524,6 +524,77 @@ def test_list_jobs_status_filter_exact_match(tmp_path, monkeypatch):
     assert result.jobs[0].url == "https://a.com"
 
 
+def test_list_jobs_status_accepts_a_list_of_statuses(tmp_path, monkeypatch):
+    """A list matches any of its members, so grouped questions stay one call.
+
+    "What have I applied to" spans six of the seven statuses. The server does
+    not name that group — the caller passes the members it means.
+    """
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
+
+    jobs = [
+        StoredJob(**_make_job(url="https://a.com", status="applied")),
+        StoredJob(**_make_job(url="https://b.com", status="interviewing")),
+        StoredJob(**_make_job(url="https://c.com", status="offer")),
+        StoredJob(**_make_job(url="https://d.com", status="not_applied")),
+    ]
+    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
+
+    result = list_jobs(status=["applied", "interviewing", "offer"])
+
+    assert result.success is True
+    assert result.count == 3
+    assert "https://d.com" not in {j.url for j in result.jobs}
+
+
+def test_list_jobs_status_list_composes_with_sort_and_limit(tmp_path, monkeypatch):
+    """The point of filtering server-side: sort and limit apply to the group."""
+    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
+
+    jobs = [
+        StoredJob(**_make_job(url="https://low.com", status="applied", score=10)),
+        StoredJob(**_make_job(url="https://high.com", status="interviewing", score=95)),
+        StoredJob(**_make_job(url="https://mid.com", status="offer", score=50)),
+        StoredJob(**_make_job(url="https://top.com", status="not_applied", score=99)),
+    ]
+    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
+
+    result = list_jobs(
+        status=["applied", "interviewing", "offer"], sort_by="score", limit=2
+    )
+
+    assert result.success is True
+    assert [j.url for j in result.jobs] == ["https://high.com", "https://mid.com"]
+
+
+def test_list_jobs_status_list_with_invalid_member_returns_error(tmp_path, monkeypatch):
+    """One bad member invalidates the whole filter, and the error names it."""
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs
+
+    result = list_jobs(status=["applied", "bogus"])
+
+    assert result.success is False
+    assert "bogus" in result.error_message
+
+
+def test_list_jobs_empty_status_list_returns_error(tmp_path, monkeypatch):
+    """An empty filter is a caller mistake, not a request for zero rows.
+
+    Mirrors the existing limit=0 decision: surface an error envelope rather
+    than silently returning an empty result that looks like real data.
+    """
+    _patch_jobs_path(monkeypatch, tmp_path)
+    from tools.jobs_store import list_jobs
+
+    result = list_jobs(status=[])
+
+    assert result.success is False
+    assert result.error_message
+
+
 def test_list_jobs_status_filter_is_exact_not_grouped(tmp_path, monkeypatch):
     """SC-24: status filter is an exact match — 'interviewing' does NOT also
     match 'applied' or other post-application statuses (unlike the old
