@@ -115,3 +115,59 @@ def test_atomic_write_json_cleans_temp_on_error(tmp_path):
     # No orphan temp files
     temp_files = list(tmp_path.glob(".dummy_tmp_*"))
     assert len(temp_files) == 0, f"Orphan temp files found: {temp_files}"
+
+
+def test_atomic_write_json_fsyncs_before_rename(tmp_path, monkeypatch):
+    """Data must reach the disk before the rename publishes the new file.
+
+    Path.replace makes the directory entry swap atomic, but without an fsync
+    the file's bytes may still be in the OS write-back cache. A crash between
+    the rename and writeback leaves a truncated or zero-length store — the
+    exact corruption this helper exists to prevent.
+    """
+    import os
+    import tools._storage as storage_mod
+    from tools._storage import atomic_write_json
+
+    synced: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        storage_mod.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1]
+    )
+
+    path = tmp_path / "data.json"
+    atomic_write_json(_DummyModel(name="durable"), path, tmp_prefix=".dummy_tmp_")
+
+    assert synced, "atomic_write_json completed without fsyncing the temp file"
+    assert json.loads(path.read_text(encoding="utf-8"))["name"] == "durable"
+
+
+def test_atomic_write_json_closes_fd_when_open_fails(tmp_path, monkeypatch):
+    """A failure opening the temp fd must not leak it or mask the real error.
+
+    open() takes ownership of the fd only once it succeeds. If it raises, the
+    fd is still ours; leaving it open leaks a descriptor and, on Windows,
+    makes the cleanup unlink fail and replace the original exception.
+    """
+    import os
+    import tools._storage as storage_mod
+    from tools._storage import atomic_write_json
+
+    closed: list[int] = []
+    real_close = os.close
+    monkeypatch.setattr(
+        storage_mod.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1]
+    )
+    monkeypatch.setattr(
+        storage_mod,
+        "open",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")),
+        raising=False,
+    )
+
+    path = tmp_path / "data.json"
+    with pytest.raises(OSError, match="boom"):
+        atomic_write_json(_DummyModel(name="x"), path, tmp_prefix=".dummy_tmp_")
+
+    assert closed, "temp fd was leaked when open() failed"
+    assert list(tmp_path.glob(".dummy_tmp_*")) == []

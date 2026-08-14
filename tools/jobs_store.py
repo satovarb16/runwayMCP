@@ -134,6 +134,17 @@ class SetStatusResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class SchemaTooNewError(ValueError):
+    """The store was written by a newer runway-mcp than this one understands.
+
+    A ValueError subclass so every existing `except ValueError` at the tool
+    boundary still turns it into an error envelope, but a distinct type so
+    _read_jobs can let it through without the "corrupt" wrapper. The file is
+    not corrupt — it is fine, and telling the user otherwise is what makes
+    them delete it.
+    """
+
+
 def _coerce_legacy(raw: dict) -> tuple[dict, bool]:
     """Coerce a pre-migration jobs payload to the current schema, in memory only.
 
@@ -164,6 +175,18 @@ def _coerce_legacy(raw: dict) -> tuple[dict, bool]:
                     Raised rather than skipped so a malformed store surfaces as
                     corrupt instead of silently losing records.
     """
+    found_version = raw.get("schema_version")
+    if isinstance(found_version, int) and found_version > _SCHEMA_VERSION:
+        # Refuse rather than downgrade. Treating every mismatch as "legacy"
+        # re-stamped a newer store as the current version and let pydantic
+        # drop the fields it does not know about, so the next write persisted
+        # the lossy copy.
+        raise SchemaTooNewError(
+            f"Jobs store was written by a newer version of runway-mcp "
+            f"(schema_version {found_version} > {_SCHEMA_VERSION}). The file is "
+            f"fine: upgrade runway-mcp rather than letting it rewrite the file."
+        )
+
     jobs = raw.get("jobs", [])
     if not isinstance(jobs, list):
         raise ValueError(f"expected 'jobs' to be a list, got {type(jobs).__name__}")
@@ -249,6 +272,9 @@ def _read_jobs(path: Path | None = None) -> JobStore:
         if was_legacy:
             _backup_once(resolved)
         return JobStore.model_validate(coerced)
+    except SchemaTooNewError:
+        # Already accurate and actionable — do not relabel it as corruption.
+        raise
     except OSError as exc:
         # Unreadable is not the same as corrupt — the file may be perfectly
         # valid. Wrapped as ValueError so callers need only one except clause
@@ -323,11 +349,15 @@ def save_job_analysis(
             if updated
             else ApplicationStatus.NOT_APPLIED
         )
-        # Preserve `notes` on upsert for the same reason status is preserved:
-        # set_application_status writes application-tracking notes ("phone
-        # screen 6/12"), and re-analyzing a reposted listing must not wipe
-        # them. An explicit notes argument still overwrites.
-        existing_notes = store.jobs[existing_index].notes if updated else None
+        # One rule for every optional field: an omitted argument means "leave
+        # it alone". Applying it to some fields and not others is what made a
+        # bare re-save of a reposted listing keep the user's notes while
+        # destroying the score and recommendation — and drop the job out of
+        # every min_score query. An explicit argument still overwrites.
+        previous = store.jobs[existing_index] if updated else None
+        existing_notes = previous.notes if previous else None
+        existing_score = previous.score if previous else None
+        existing_recommendation = previous.recommendation if previous else None
 
         # Build the new record (server stamps analyzed_at)
         # FIX 2: StoredJob construction is inside the try so ValidationError is caught
@@ -338,8 +368,12 @@ def save_job_analysis(
             visa_verdict=visa_verdict,
             analyzed_at=datetime.now(timezone.utc).isoformat(),
             status=existing_status,
-            score=score,
-            recommendation=recommendation,
+            score=score if score is not None else existing_score,
+            recommendation=(
+                recommendation
+                if recommendation is not None
+                else existing_recommendation
+            ),
             notes=notes if notes is not None else existing_notes,
         )
 
