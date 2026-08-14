@@ -35,3 +35,6 @@ Thumbs.db
 .atl/
 # Local dev MCP config (run server from source); not shipped in the repo
 .mcp.json
+
+# uv lockfile — CI installs with pip and this is a published package, so nothing reads it
+uv.lock
