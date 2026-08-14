@@ -362,7 +362,7 @@ def save_job_analysis(
 
 def list_jobs(
     since: str | None = None,
-    status: str | None = None,
+    status: str | list[str] | None = None,
     min_score: int | None = None,
     limit: int | None = None,
     sort_by: str = "analyzed_at",
@@ -374,9 +374,14 @@ def list_jobs(
     Args:
         since:     ISO-8601 string cutoff (inclusive). Only jobs where
                    analyzed_at >= since are returned (lexicographic compare).
-        status:    If provided, return only jobs whose status exactly matches
-                   this value (one of the 7 ApplicationStatus members). If
-                   None (default), no filter applied.
+        status:    One ApplicationStatus value, or a list of them to match any
+                   member of the group. Grouped questions ("what have I
+                   applied to" spans six of the seven statuses) are the
+                   caller's to name — the server filters by what it is given
+                   and never defines what "applied" or "active" means. Passing
+                   a list is what lets sort_by and limit apply to the group
+                   server-side instead of shipping the whole store back. None
+                   (default) applies no filter; an empty list is an error.
         min_score: Minimum score threshold (inclusive). Jobs with score=None
                    are excluded when this filter is active.
         limit:     Maximum number of records to return (after sort).
@@ -407,17 +412,38 @@ def list_jobs(
                 error_message=f"Invalid 'since' timestamp or corrupt record timestamp: {exc}",
             )
     if status is not None:
-        try:
-            status_member = ApplicationStatus(status)
-        except ValueError:
+        if isinstance(status, str):
+            requested = [status]
+        elif isinstance(status, (list, tuple)):
+            requested = list(status)
+        else:
             return ListJobsResult(
                 success=False,
                 error_message=(
-                    f"Invalid status: {status!r} (use one of: "
-                    f"{', '.join(m.value for m in ApplicationStatus)})"
+                    f"Invalid status: expected a string or a list of strings, "
+                    f"got {type(status).__name__}"
                 ),
             )
-        items = [j for j in items if j.status == status_member]
+        if not requested:
+            return ListJobsResult(
+                success=False,
+                error_message=(
+                    "Invalid status: empty list. Omit the filter to return every job."
+                ),
+            )
+        wanted = set()
+        for value in requested:
+            try:
+                wanted.add(ApplicationStatus(value))
+            except ValueError:
+                return ListJobsResult(
+                    success=False,
+                    error_message=(
+                        f"Invalid status: {value!r} (use one of: "
+                        f"{', '.join(m.value for m in ApplicationStatus)})"
+                    ),
+                )
+        items = [j for j in items if j.status in wanted]
     if min_score is not None:
         items = [j for j in items if j.score is not None and j.score >= min_score]
 
