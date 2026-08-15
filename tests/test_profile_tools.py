@@ -1,20 +1,18 @@
-"""Integration tests for _persist, setup_profile, update_profile, get_profile.
+"""Tests for tools.profile: the read-only get_profile migration hatch.
 
-Option A: the conversation-side Claude extracts the profile from the CV and
-passes structured ProfileData to these tools, which only persist/retrieve it.
-No MCP sampling, no CV file reading on the server.
+setup_profile and update_profile were removed in this change (SC-17) —
+resumes are now version-tracked via tools.resumes (save_resume_version).
+get_profile remains unchanged, read-only, for one release so Claude can
+read a legacy profile.json and re-submit it as text via save_resume_version.
 """
 
 from __future__ import annotations
 
 import json
-import pytest
 from pathlib import Path
 
+import pytest
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _SAMPLE_PROFILE_DICT = {
     "name": "Jane Doe",
@@ -29,12 +27,6 @@ _SAMPLE_PROFILE_DICT = {
 _SAMPLE_PROFILE_JSON = json.dumps(_SAMPLE_PROFILE_DICT)
 
 
-def _make_profile():
-    from tools.profile import ProfileData
-
-    return ProfileData.model_validate(_SAMPLE_PROFILE_DICT)
-
-
 def _patch_profile_path(monkeypatch, tmp_path: Path) -> Path:
     """Redirect _PROFILE_PATH to a temp location."""
     import tools.profile as profile_mod
@@ -45,130 +37,50 @@ def _patch_profile_path(monkeypatch, tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# _persist — overwrite=False, no existing profile → success
+# SC-17: setup_profile / update_profile no longer exist
 # ---------------------------------------------------------------------------
 
 
-def test_persist_no_existing_profile_creates_file(tmp_path, monkeypatch):
-    from tools.profile import _persist
+def test_setup_profile_not_importable():
+    """SC-17: setup_profile no longer exists on tools.profile."""
+    import tools.profile as profile_mod
 
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-
-    result = _persist(_make_profile(), overwrite=False)
-
-    assert result.success is True
-    assert profile_path.exists()
-    assert result.profile_summary["name"] == "Jane Doe"
-    assert result.profile_summary["skills_count"] == 2
-    assert result.profile_summary["experience_years"] == pytest.approx(2.5)
+    assert not hasattr(profile_mod, "setup_profile")
 
 
-# ---------------------------------------------------------------------------
-# _persist — overwrite=False + profile exists → ValueError
-# ---------------------------------------------------------------------------
+def test_update_profile_not_importable():
+    """SC-17: update_profile no longer exists on tools.profile."""
+    import tools.profile as profile_mod
+
+    assert not hasattr(profile_mod, "update_profile")
 
 
-def test_persist_overwrite_false_profile_exists_raises(tmp_path, monkeypatch):
-    from tools.profile import _persist
+def test_setup_profile_not_registered_on_server():
+    """SC-17: setup_profile is not a registered MCP tool."""
+    import server
 
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    profile_path.write_text('{"name": "Old"}', encoding="utf-8")
-
-    with pytest.raises(ValueError, match="(?i)use update_profile"):
-        _persist(_make_profile(), overwrite=False)
+    tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
+    assert "setup_profile" not in tool_names
 
 
-# ---------------------------------------------------------------------------
-# _persist — overwrite=True + profile exists → overwrites
-# ---------------------------------------------------------------------------
+def test_update_profile_not_registered_on_server():
+    """SC-17: update_profile is not a registered MCP tool."""
+    import server
+
+    tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
+    assert "update_profile" not in tool_names
 
 
-def test_persist_overwrite_true_replaces_existing(tmp_path, monkeypatch):
-    from tools.profile import _persist
+def test_get_profile_still_registered_on_server():
+    """get_profile survives as the read-only migration hatch."""
+    import server
 
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text('{"name": "Old"}', encoding="utf-8")
-
-    result = _persist(_make_profile(), overwrite=True)
-
-    assert result.success is True
-    loaded = json.loads(profile_path.read_text(encoding="utf-8"))
-    assert loaded["name"] == "Jane Doe"
+    tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
+    assert "get_profile" in tool_names
 
 
 # ---------------------------------------------------------------------------
-# setup_profile — success path (via public API)
-# ---------------------------------------------------------------------------
-
-
-def test_setup_profile_success(tmp_path, monkeypatch):
-    from tools.profile import setup_profile
-
-    _patch_profile_path(monkeypatch, tmp_path)
-
-    result = setup_profile(_make_profile())
-
-    assert result.success is True
-    assert result.profile_summary is not None
-    assert result.error_message is None
-
-
-# ---------------------------------------------------------------------------
-# setup_profile — profile already exists → success=False (no exception)
-# ---------------------------------------------------------------------------
-
-
-def test_setup_profile_already_exists_returns_failure(tmp_path, monkeypatch):
-    from tools.profile import setup_profile
-
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text('{"name": "Old"}', encoding="utf-8")
-
-    result = setup_profile(_make_profile())
-
-    assert result.success is False
-    assert "update_profile" in result.error_message
-
-
-# ---------------------------------------------------------------------------
-# update_profile — overwrites existing profile
-# ---------------------------------------------------------------------------
-
-
-def test_update_profile_overwrites(tmp_path, monkeypatch):
-    from tools.profile import update_profile
-
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text('{"name": "Old"}', encoding="utf-8")
-
-    result = update_profile(_make_profile())
-
-    assert result.success is True
-    loaded = json.loads(profile_path.read_text(encoding="utf-8"))
-    assert loaded["name"] == "Jane Doe"
-
-
-# ---------------------------------------------------------------------------
-# update_profile — no existing profile → creates one
-# ---------------------------------------------------------------------------
-
-
-def test_update_profile_creates_when_missing(tmp_path, monkeypatch):
-    from tools.profile import update_profile
-
-    profile_path = _patch_profile_path(monkeypatch, tmp_path)
-
-    result = update_profile(_make_profile())
-
-    assert result.success is True
-    assert profile_path.exists()
-
-
-# ---------------------------------------------------------------------------
-# get_profile
+# SC-15: get_profile — legacy file present, behavior unchanged
 # ---------------------------------------------------------------------------
 
 
@@ -187,6 +99,11 @@ def test_get_profile_success(tmp_path, monkeypatch):
     assert result.error is None
 
 
+# ---------------------------------------------------------------------------
+# SC-16: get_profile — no legacy file, unchanged no_profile error
+# ---------------------------------------------------------------------------
+
+
 def test_get_profile_no_profile(tmp_path, monkeypatch):
     from tools.profile import get_profile
 
@@ -197,7 +114,7 @@ def test_get_profile_no_profile(tmp_path, monkeypatch):
     assert result.success is False
     assert result.profile is None
     assert result.error == "no_profile"
-    assert "setup_profile" in result.message
+    assert result.message is not None
 
 
 def test_get_profile_corrupt(tmp_path, monkeypatch):
@@ -214,7 +131,7 @@ def test_get_profile_corrupt(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _read_profile
+# _read_profile — still used internally by get_profile
 # ---------------------------------------------------------------------------
 
 
@@ -242,7 +159,7 @@ def test_read_profile_missing(tmp_path, monkeypatch):
     missing_path = tmp_path / "no_profile.json"
     monkeypatch.setattr(profile_mod, "_PROFILE_PATH", missing_path)
 
-    with pytest.raises(ValueError, match="(?i)no profile|not found|setup_profile"):
+    with pytest.raises(ValueError, match="(?i)no profile|not found"):
         _read_profile(path=missing_path)
 
 
@@ -259,47 +176,38 @@ def test_read_profile_corrupt(tmp_path, monkeypatch):
         _read_profile(path=profile_path)
 
 
-# ---------------------------------------------------------------------------
-# load_profile — public contract
-# ---------------------------------------------------------------------------
+def test_get_profile_missing_is_never_labelled_corrupt(tmp_path, monkeypatch):
+    """A missing profile is `no_profile`, never `corrupt`, even under a race.
 
-
-def test_load_profile_success(tmp_path, monkeypatch):
-    """load_profile returns a ProfileData when the file exists and is valid."""
+    get_profile used to call exists() and then read. If the file vanished in
+    between — and the module docstring now tells users to delete it by hand —
+    the missing file came back as error="corrupt" with the message
+    "No profile found.", an envelope contradicting itself.
+    """
     import tools.profile as profile_mod
-    from tools.profile import load_profile, ProfileData
+    from tools.profile import get_profile, ProfileNotFound
 
-    profile_path = tmp_path / "profile.json"
-    profile_path.write_text(_SAMPLE_PROFILE_JSON, encoding="utf-8")
-    monkeypatch.setattr(profile_mod, "_PROFILE_PATH", profile_path)
+    monkeypatch.setattr(profile_mod, "_PROFILE_PATH", tmp_path / "profile.json")
+    monkeypatch.setattr(
+        profile_mod,
+        "_read_profile",
+        lambda *a, **k: (_ for _ in ()).throw(ProfileNotFound("No profile found.")),
+    )
 
-    result = load_profile(path=profile_path)
+    result = get_profile()
 
-    assert isinstance(result, ProfileData)
-    assert result.name == "Jane Doe"
-    assert result.skills == ["Python", "Go"]
+    assert result.error == "no_profile"
+    assert "corrupt" not in (result.message or "")
 
 
-def test_load_profile_missing(tmp_path, monkeypatch):
-    """load_profile raises ValueError when the profile file does not exist."""
+def test_get_profile_missing_points_at_the_replacement_tool(tmp_path, monkeypatch):
+    """The migration hatch must name where to go, not just say no."""
     import tools.profile as profile_mod
-    from tools.profile import load_profile
+    from tools.profile import get_profile
 
-    missing_path = tmp_path / "no_profile.json"
-    monkeypatch.setattr(profile_mod, "_PROFILE_PATH", missing_path)
+    monkeypatch.setattr(profile_mod, "_PROFILE_PATH", tmp_path / "nope.json")
 
-    with pytest.raises(ValueError, match="(?i)no profile|not found|setup_profile"):
-        load_profile(path=missing_path)
+    result = get_profile()
 
-
-def test_load_profile_corrupt(tmp_path, monkeypatch):
-    """load_profile raises ValueError when the file contains invalid JSON."""
-    import tools.profile as profile_mod
-    from tools.profile import load_profile
-
-    profile_path = tmp_path / "profile.json"
-    profile_path.write_text("{corrupt json!!}", encoding="utf-8")
-    monkeypatch.setattr(profile_mod, "_PROFILE_PATH", profile_path)
-
-    with pytest.raises(ValueError, match="(?i)corrupt|parse|invalid"):
-        load_profile(path=profile_path)
+    assert result.error == "no_profile"
+    assert "save_resume_version" in result.message

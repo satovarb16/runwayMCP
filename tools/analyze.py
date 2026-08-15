@@ -1,10 +1,11 @@
 """Orchestrator tool: analyze_job.
 
-Combines fetch_job_posting → check_visa_sponsorship → profile load into a
-single envelope, then hands the data to the conversation-side Claude to score
-and recommend. The server performs NO LLM reasoning (no MCP sampling): it
-gathers the facts (job, visa history, stored profile) and the scoring rubric,
-and Claude produces the match score and APPLY/CONSIDER/SKIP verdict from them.
+Combines fetch_job_posting → check_visa_sponsorship → general resume load
+into a single envelope, then hands the data to the conversation-side Claude
+to score and recommend. The server performs NO LLM reasoning (no MCP
+sampling): it gathers the facts (job, visa history, the candidate's general
+resume text) and the scoring rubric, and Claude produces the match score and
+APPLY/CONSIDER/SKIP verdict from them.
 
 Adds zero new external dependencies — all I/O is delegated to the sub-tools.
 """
@@ -15,7 +16,7 @@ from pydantic import BaseModel
 
 from tools.jobs import fetch_job_posting, JobPostingResult
 from tools.visa import check_visa_sponsorship, VisaResult
-from tools.profile import _read_profile, ProfileData
+from tools.resumes import _read_resumes, _general_resume, ResumeVersion
 
 
 # ---------------------------------------------------------------------------
@@ -30,12 +31,15 @@ _RECOMMENDATION_RULES: list[str] = [
 ]
 
 _SCORING_INSTRUCTIONS: str = (
-    "Using the job posting, the candidate profile, and the visa verdict above, "
-    "produce: (1) a technical-fit match score from 0 to 100 based on skills, "
-    "experience, and education; (2) matched_skills and missing_skills lists; "
-    "(3) a short, factual summary of the fit; and (4) a recommendation of "
-    "APPLY, CONSIDER, or SKIP by applying the recommendation_rules in order. "
-    "Be factual and objective — do not inflate the score."
+    "Using the job posting, the candidate's general resume text, and the visa "
+    "verdict above, produce: (1) a technical-fit match score from 0 to 100 "
+    "based on skills, experience, and education; (2) matched_skills and "
+    "missing_skills lists; (3) a short, factual summary of the fit; and (4) a "
+    "recommendation of APPLY, CONSIDER, or SKIP by applying the "
+    "recommendation_rules in order. Be factual and objective — do not "
+    "inflate the score. If you recommend APPLY or CONSIDER, tailor the "
+    "resume text for this job and save it with save_resume_version "
+    "(parent_id=this resume's id, job_url=this job's url)."
 )
 
 
@@ -67,16 +71,17 @@ class ScoringGuide(BaseModel):
 class AnalyzeJobResult(BaseModel):
     """Decision-ready envelope of FACTS. Claude derives the score and verdict.
 
-    On success, job/visa/profile/scoring_guide are populated. The server does
+    On success, job/visa/resume/scoring_guide are populated. The server does
     not compute a match score or recommendation — those are left to Claude,
     which reasons over this envelope and the scoring_guide.
     """
 
     job: JobSummary | None = None
     visa: VisaSummary | None = None
-    profile: ProfileData | None = None
+    resume: ResumeVersion | None = None
     scoring_guide: ScoringGuide | None = None
-    error: str | None = None  # top-level error code: no_profile | fetch_failed
+    # top-level error code: no_resume | corrupt | fetch_failed
+    error: str | None = None
     message: str | None = None  # human-readable explanation for top-level errors
 
 
@@ -114,17 +119,24 @@ def _scoring_guide() -> ScoringGuide:
 
 
 async def analyze_job(url: str) -> AnalyzeJobResult:
-    """Gather job + visa + profile for a posting so Claude can score the match.
+    """Gather job + visa + resume for a posting so Claude can score the match.
 
     Performs the data-gathering half of a job analysis in one call:
-    1. Verifies a profile exists (returns error envelope if not).
+    1. Verifies a general resume exists (returns error envelope if not) —
+       checked BEFORE any fetch so a request that cannot be scored anyway
+       never pays for a network call.
     2. Fetches the job posting from the given URL.
     3. Checks H-1B visa sponsorship history for the company.
-    4. Returns the job, visa verdict, stored profile, and a scoring guide.
+    4. Returns the job, visa verdict, the general resume, and a scoring guide.
 
     The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
-    this tool — after calling it, score the candidate profile against the job
+    this tool — after calling it, score the candidate's resume against the job
     and apply the scoring_guide's recommendation_rules in your reply.
+
+    The resume injected here is the GENERAL resume (design D6), not the most
+    recently tailored one: scoring a job against a resume already tailored
+    FOR that job would inflate the match score by scoring the resume against
+    itself.
 
     This tool NEVER raises — all failures are encoded in the return envelope.
 
@@ -132,21 +144,22 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
         url: The raw job posting URL to analyze.
 
     Returns:
-        AnalyzeJobResult with job, visa, profile, and scoring_guide populated
+        AnalyzeJobResult with job, visa, resume, and scoring_guide populated
         on success, or error/message fields populated on failure.
     """
-    # --- Step 1: Profile precondition (BEFORE any fetch) ---
+    # --- Step 1: Resume precondition (BEFORE any fetch) ---
     try:
-        profile = _read_profile()
-        if profile is None:
-            return AnalyzeJobResult(
-                error="no_profile",
-                message="No profile found. Run setup_profile first.",
-            )
-    except (FileNotFoundError, ValueError):
+        store = _read_resumes()
+        resume = _general_resume(store, for_job_url=url)
+    except ValueError as exc:
+        # NOT no_resume: the store exists and is unreadable or malformed.
+        # Telling the user to run save_resume_version here sends them to a
+        # tool that will fail the same way, on the same file.
+        return AnalyzeJobResult(error="corrupt", message=str(exc))
+    if resume is None:
         return AnalyzeJobResult(
-            error="no_profile",
-            message="No profile found. Run setup_profile first.",
+            error="no_resume",
+            message="No resume found. Run save_resume_version first.",
         )
 
     # --- Step 2: Fetch job posting ---
@@ -181,6 +194,6 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
     return AnalyzeJobResult(
         job=job_summary,
         visa=visa_summary,
-        profile=profile,
+        resume=resume,
         scoring_guide=_scoring_guide(),
     )
