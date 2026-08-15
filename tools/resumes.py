@@ -25,9 +25,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tools import _storage
+from tools._storage import store_lock
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -45,6 +46,11 @@ _SCHEMA_VERSION: int = 1
 class ResumeVersion(BaseModel):
     """A single saved resume version. Content is raw text, stored verbatim."""
 
+    # Unknown fields are an error, not something to drop quietly — an
+    # append-only store that silently discards fields it does not recognise
+    # is not actually preserving history.
+    model_config = ConfigDict(extra="forbid")
+
     id: str  # uuid4().hex, server-generated
     label: str
     content: str  # raw text — sole source of truth, no format/length validation
@@ -59,6 +65,8 @@ class ResumeVersion(BaseModel):
 
 class ResumeStore(BaseModel):
     """Top-level container for the resumes.json file."""
+
+    model_config = ConfigDict(extra="forbid")
 
     schema_version: int = _SCHEMA_VERSION
     versions: list[ResumeVersion] = []
@@ -283,71 +291,75 @@ def save_resume_version(
         "corrupt" on a store read failure, "write_error" on a store write
         failure).
     """
-    try:
-        store = _read_resumes()
-    except ValueError as exc:
-        return SaveResumeVersionResult(success=False, error="corrupt", message=str(exc))
 
-    if not store.versions:
-        if parent_id is not None:
+    with store_lock(_RESUMES_PATH):
+        try:
+            store = _read_resumes()
+        except ValueError as exc:
             return SaveResumeVersionResult(
-                success=False,
-                error="invalid_parent",
-                message=(
-                    "The store is empty; the first saved version must have "
-                    "parent_id=None."
-                ),
-            )
-    else:
-        if parent_id is None:
-            return SaveResumeVersionResult(
-                success=False,
-                error="invalid_parent",
-                message=(
-                    "A base version already exists; parent_id is required "
-                    "for subsequent versions."
-                ),
-            )
-        if not any(v.id == parent_id for v in store.versions):
-            return SaveResumeVersionResult(
-                success=False,
-                error="parent_not_found",
-                message=f"No resume version exists with id {parent_id!r}.",
+                success=False, error="corrupt", message=str(exc)
             )
 
-    # Build the record OUTSIDE the write try: a bad content/label type is a
-    # caller input error, and reporting it as "write_error" would send a
-    # caller branching on the error codes into a retry loop instead of fixing
-    # its arguments.
-    try:
-        record = ResumeVersion(
-            id=uuid.uuid4().hex,
-            label=label,
-            content=content,
-            parent_id=parent_id,
-            job_url=job_url,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-    except ValidationError as exc:
+        if not store.versions:
+            if parent_id is not None:
+                return SaveResumeVersionResult(
+                    success=False,
+                    error="invalid_parent",
+                    message=(
+                        "The store is empty; the first saved version must have "
+                        "parent_id=None."
+                    ),
+                )
+        else:
+            if parent_id is None:
+                return SaveResumeVersionResult(
+                    success=False,
+                    error="invalid_parent",
+                    message=(
+                        "A base version already exists; parent_id is required "
+                        "for subsequent versions."
+                    ),
+                )
+            if not any(v.id == parent_id for v in store.versions):
+                return SaveResumeVersionResult(
+                    success=False,
+                    error="parent_not_found",
+                    message=f"No resume version exists with id {parent_id!r}.",
+                )
+
+        # Build the record OUTSIDE the write try: a bad content/label type is a
+        # caller input error, and reporting it as "write_error" would send a
+        # caller branching on the error codes into a retry loop instead of fixing
+        # its arguments.
+        try:
+            record = ResumeVersion(
+                id=uuid.uuid4().hex,
+                label=label,
+                content=content,
+                parent_id=parent_id,
+                job_url=job_url,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except ValidationError as exc:
+            return SaveResumeVersionResult(
+                success=False, error="invalid_input", message=str(exc)
+            )
+
+        try:
+            store.versions.append(record)
+            _write_resumes(store)
+        except Exception as exc:
+            return SaveResumeVersionResult(
+                success=False, error="write_error", message=str(exc)
+            )
+
         return SaveResumeVersionResult(
-            success=False, error="invalid_input", message=str(exc)
+            success=True,
+            id=record.id,
+            label=record.label,
+            parent_id=record.parent_id,
+            storage_path=str(_RESUMES_PATH.resolve()),
         )
-
-    try:
-        store.versions.append(record)
-        _write_resumes(store)
-    except Exception as exc:
-        return SaveResumeVersionResult(
-            success=False, error="write_error", message=str(exc)
-        )
-
-    return SaveResumeVersionResult(
-        success=True,
-        id=record.id,
-        label=record.label,
-        parent_id=record.parent_id,
-        storage_path=str(_RESUMES_PATH.resolve()),
-    )
 
 
 def get_resume_version(id: str) -> GetResumeVersionResult:

@@ -1468,3 +1468,53 @@ def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
     assert result.count == 2
     assert result.jobs[0].url == "https://new-high-b.com"  # score=95 first
     assert result.jobs[1].url == "https://new-high-a.com"  # score=85 second
+
+
+@pytest.mark.contract
+def test_stored_job_rejects_unknown_fields(tmp_path):
+    """A stale kwarg must fail loudly instead of being dropped.
+
+    Pydantic ignores unknown fields by default. During the applied->status
+    rename that turned a stale `applied=True` into a silent no-op, which
+    surfaced much later as a baffling wrong-value assertion rather than an
+    immediate error at the call site.
+    """
+    from pydantic import ValidationError
+    from tools.jobs_store import StoredJob
+
+    with pytest.raises(ValidationError):
+        StoredJob(**_make_job(), applied=True)
+
+
+def test_read_jobs_rejects_a_record_with_unknown_fields(tmp_path):
+    """An unrecognised field in a stored record is corrupt, not ignorable.
+
+    Silently dropping it is how the migration path lost data before: the
+    record round-trips through the next write without the field, and nothing
+    ever said so.
+    """
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    record = _make_job()
+    record["salary_band"] = "120-150k"
+    jobs_path.write_text(
+        json.dumps({"schema_version": 2, "jobs": [record]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="(?i)corrupt"):
+        _read_jobs(path=jobs_path)
+
+
+def test_read_jobs_still_migrates_a_clean_legacy_file(tmp_path):
+    """extra=forbid must not break the legacy path: `applied` is popped first."""
+    from tools.jobs_store import _read_jobs
+
+    jobs_path = tmp_path / "jobs.json"
+    jobs_path.write_text(
+        json.dumps({"jobs": [_legacy_job_dict(applied=True)]}), encoding="utf-8"
+    )
+
+    result = _read_jobs(path=jobs_path)
+
+    assert result.jobs[0].status == "applied"

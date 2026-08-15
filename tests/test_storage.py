@@ -171,3 +171,49 @@ def test_atomic_write_json_closes_fd_when_open_fails(tmp_path, monkeypatch):
 
     assert closed, "temp fd was leaked when open() failed"
     assert list(tmp_path.glob(".dummy_tmp_*")) == []
+
+
+def test_store_lock_serializes_read_modify_write(tmp_path, monkeypatch):
+    """Two concurrent read-modify-write cycles must not lose an update.
+
+    Without the lock both threads read the same snapshot, each adds its own
+    entry, and whichever writes last wins — the other entry is gone. No
+    corruption, no error, just a silently missing record. atomic_write_json
+    prevents a half-written file; it cannot prevent a lost write.
+    """
+    import json
+    import threading
+    from tools._storage import store_lock
+
+    path = tmp_path / "counter.json"
+    path.write_text(json.dumps({"entries": []}), encoding="utf-8")
+    start = threading.Barrier(2)
+
+    def append(name: str) -> None:
+        start.wait()  # maximize overlap
+        with store_lock(path):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["entries"].append(name)
+            # widen the read-modify-write window so an unlocked version
+            # would reliably lose one entry rather than flakily
+            threading.Event().wait(0.05)
+            path.write_text(json.dumps(data), encoding="utf-8")
+
+    threads = [threading.Thread(target=append, args=(n,)) for n in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    entries = json.loads(path.read_text(encoding="utf-8"))["entries"]
+    assert sorted(entries) == ["a", "b"], f"lost an update: {entries}"
+
+
+def test_store_lock_is_reentrant_across_sequential_calls(tmp_path):
+    """Acquiring and releasing repeatedly must not deadlock or leak."""
+    from tools._storage import store_lock
+
+    path = tmp_path / "seq.json"
+    for _ in range(3):
+        with store_lock(path):
+            pass

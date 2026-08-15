@@ -23,9 +23,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tools import _storage
+from tools._storage import store_lock
 
 # ---------------------------------------------------------------------------
 # ISO-8601 parsing helper
@@ -79,6 +80,12 @@ class ApplicationStatus(str, Enum):
 class StoredJob(BaseModel):
     """A single analyzed job record persisted to the jobs store."""
 
+    # Unknown fields are an error, not something to drop quietly. Pydantic
+    # ignores them by default, which during the applied->status rename let a
+    # stale kwarg pass silently and surface later as a baffling wrong-value
+    # assertion instead of an immediate failure.
+    model_config = ConfigDict(extra="forbid")
+
     url: str  # dedup / upsert key
     title: str
     company: str
@@ -92,6 +99,8 @@ class StoredJob(BaseModel):
 
 class JobStore(BaseModel):
     """Top-level container for the jobs.json file."""
+
+    model_config = ConfigDict(extra="forbid")
 
     schema_version: int = _SCHEMA_VERSION
     jobs: list[StoredJob] = []
@@ -333,65 +342,69 @@ def save_job_analysis(
         SaveJobResult with success=True, url, updated flag, and storage_path on
         success; success=False with error_message on failure.
     """
-    try:
-        store = _read_jobs()
-    except ValueError as exc:
-        return SaveJobResult(success=False, error_message=str(exc))
 
-    # Detect upsert
-    existing_index = next((i for i, j in enumerate(store.jobs) if j.url == url), None)
-    updated = existing_index is not None
+    with store_lock(_JOBS_PATH):
+        try:
+            store = _read_jobs()
+        except ValueError as exc:
+            return SaveJobResult(success=False, error_message=str(exc))
 
-    try:
-        # FIX 3: preserve `status` on upsert; default NOT_APPLIED for new records
-        existing_status = (
-            store.jobs[existing_index].status
-            if updated
-            else ApplicationStatus.NOT_APPLIED
+        # Detect upsert
+        existing_index = next(
+            (i for i, j in enumerate(store.jobs) if j.url == url), None
         )
-        # One rule for every optional field: an omitted argument means "leave
-        # it alone". Applying it to some fields and not others is what made a
-        # bare re-save of a reposted listing keep the user's notes while
-        # destroying the score and recommendation — and drop the job out of
-        # every min_score query. An explicit argument still overwrites.
-        previous = store.jobs[existing_index] if updated else None
-        existing_notes = previous.notes if previous else None
-        existing_score = previous.score if previous else None
-        existing_recommendation = previous.recommendation if previous else None
+        updated = existing_index is not None
 
-        # Build the new record (server stamps analyzed_at)
-        # FIX 2: StoredJob construction is inside the try so ValidationError is caught
-        new_record = StoredJob(
+        try:
+            # FIX 3: preserve `status` on upsert; default NOT_APPLIED for new records
+            existing_status = (
+                store.jobs[existing_index].status
+                if updated
+                else ApplicationStatus.NOT_APPLIED
+            )
+            # One rule for every optional field: an omitted argument means "leave
+            # it alone". Applying it to some fields and not others is what made a
+            # bare re-save of a reposted listing keep the user's notes while
+            # destroying the score and recommendation — and drop the job out of
+            # every min_score query. An explicit argument still overwrites.
+            previous = store.jobs[existing_index] if updated else None
+            existing_notes = previous.notes if previous else None
+            existing_score = previous.score if previous else None
+            existing_recommendation = previous.recommendation if previous else None
+
+            # Build the new record (server stamps analyzed_at)
+            # FIX 2: StoredJob construction is inside the try so ValidationError is caught
+            new_record = StoredJob(
+                url=url,
+                title=title,
+                company=company,
+                visa_verdict=visa_verdict,
+                analyzed_at=datetime.now(timezone.utc).isoformat(),
+                status=existing_status,
+                score=score if score is not None else existing_score,
+                recommendation=(
+                    recommendation
+                    if recommendation is not None
+                    else existing_recommendation
+                ),
+                notes=notes if notes is not None else existing_notes,
+            )
+
+            if updated:
+                store.jobs[existing_index] = new_record
+            else:
+                store.jobs.append(new_record)
+
+            _write_jobs(store)
+        except (ValueError, ValidationError) as exc:
+            return SaveJobResult(success=False, error_message=str(exc))
+
+        return SaveJobResult(
+            success=True,
             url=url,
-            title=title,
-            company=company,
-            visa_verdict=visa_verdict,
-            analyzed_at=datetime.now(timezone.utc).isoformat(),
-            status=existing_status,
-            score=score if score is not None else existing_score,
-            recommendation=(
-                recommendation
-                if recommendation is not None
-                else existing_recommendation
-            ),
-            notes=notes if notes is not None else existing_notes,
+            updated=updated,
+            storage_path=str(_JOBS_PATH.resolve()),
         )
-
-        if updated:
-            store.jobs[existing_index] = new_record
-        else:
-            store.jobs.append(new_record)
-
-        _write_jobs(store)
-    except (ValueError, ValidationError) as exc:
-        return SaveJobResult(success=False, error_message=str(exc))
-
-    return SaveJobResult(
-        success=True,
-        url=url,
-        updated=updated,
-        storage_path=str(_JOBS_PATH.resolve()),
-    )
 
 
 def list_jobs(
@@ -536,46 +549,48 @@ def set_application_status(
         when no record matches; success=False with error/message on store
         read/write failure.
     """
-    try:
-        status_member = ApplicationStatus(status)
-    except ValueError:
-        return SetStatusResult(
-            success=False,
-            error="invalid_status",
-            message=(
-                f"Invalid status: {status!r} (use one of: "
-                f"{', '.join(m.value for m in ApplicationStatus)})"
-            ),
+
+    with store_lock(_JOBS_PATH):
+        try:
+            status_member = ApplicationStatus(status)
+        except ValueError:
+            return SetStatusResult(
+                success=False,
+                error="invalid_status",
+                message=(
+                    f"Invalid status: {status!r} (use one of: "
+                    f"{', '.join(m.value for m in ApplicationStatus)})"
+                ),
+            )
+
+        try:
+            store = _read_jobs()
+        except ValueError as exc:
+            return SetStatusResult(success=False, error="corrupt", message=str(exc))
+
+        index = next((i for i, j in enumerate(store.jobs) if j.url == url), None)
+        if index is None:
+            return SetStatusResult(success=False, error="not_found")
+
+        record = store.jobs[index]
+        previous_status = record.status
+        updated_record = record.model_copy(
+            update={
+                "status": status_member,
+                "notes": notes if notes is not None else record.notes,
+            }
         )
+        store.jobs[index] = updated_record
 
-    try:
-        store = _read_jobs()
-    except ValueError as exc:
-        return SetStatusResult(success=False, error="corrupt", message=str(exc))
+        try:
+            _write_jobs(store)
+        except Exception as exc:
+            return SetStatusResult(success=False, error="write_error", message=str(exc))
 
-    index = next((i for i, j in enumerate(store.jobs) if j.url == url), None)
-    if index is None:
-        return SetStatusResult(success=False, error="not_found")
-
-    record = store.jobs[index]
-    previous_status = record.status
-    updated_record = record.model_copy(
-        update={
-            "status": status_member,
-            "notes": notes if notes is not None else record.notes,
-        }
-    )
-    store.jobs[index] = updated_record
-
-    try:
-        _write_jobs(store)
-    except Exception as exc:
-        return SetStatusResult(success=False, error="write_error", message=str(exc))
-
-    return SetStatusResult(
-        success=True,
-        url=url,
-        status=status_member.value,
-        previous_status=previous_status.value,
-        message=f"Status set to {status_member.value}.",
-    )
+        return SetStatusResult(
+            success=True,
+            url=url,
+            status=status_member.value,
+            previous_status=previous_status.value,
+            message=f"Status set to {status_member.value}.",
+        )
