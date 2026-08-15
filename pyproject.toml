@@ -23,6 +23,7 @@ dependencies = [
     "requests",
     "beautifulsoup4",
     "rapidfuzz",
+    "filelock>=3.13",
 ]
 
 [project.urls]
