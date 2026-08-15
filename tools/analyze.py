@@ -1,21 +1,23 @@
 """Orchestrator tool: analyze_job.
 
-Combines fetch_job_posting → check_visa_sponsorship → general resume load
-into a single envelope, then hands the data to the conversation-side Claude
-to score and recommend. The server performs NO LLM reasoning (no MCP
-sampling): it gathers the facts (job, visa history, the candidate's general
-resume text) and the scoring rubric, and Claude produces the match score and
-APPLY/CONSIDER/SKIP verdict from them.
+PR1 intermediate state (sqlite-memory-and-pasted-jd, target 0.3.0): this is
+NOT the final 0.3.0 contract and NOT the pre-0.3.0 contract. `fetch_job_posting`
+and `check_visa_sponsorship` are deleted in this same change, so the job-fetch
+and visa-check steps are removed from this orchestrator entirely — not
+stubbed, not caught-and-ignored. The envelope now carries only the caller's
+general resume and the scoring rubric. The final contract (Claude-extracted
+`title`/`company`/`country` in, `extracted`/`work_authorization` out, `def`
+not `async def`) lands in PR3a once the SQLite-backed stores and the pasted-JD
+input contract are in place.
 
-Adds zero new external dependencies — all I/O is delegated to the sub-tools.
+Adds zero new external dependencies — the resume lookup is delegated to
+tools/resumes.py.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-from tools.jobs import fetch_job_posting, JobPostingResult
-from tools.visa import check_visa_sponsorship, VisaResult
 from tools.resumes import _read_resumes, _general_resume, ResumeVersion
 
 
@@ -24,41 +26,31 @@ from tools.resumes import _read_resumes, _general_resume, ResumeVersion
 # ---------------------------------------------------------------------------
 
 _RECOMMENDATION_RULES: list[str] = [
-    "SKIP if the visa verdict is RED or the match score is below 40 "
-    "(SKIP takes precedence over APPLY).",
-    "APPLY if the visa verdict is GREEN and the match score is 70 or higher.",
-    "CONSIDER in every other case (including UNKNOWN or YELLOW visa verdicts).",
+    "SKIP if the match score is below 40.",
+    "APPLY if the match score is 70 or higher.",
+    "CONSIDER in every other case.",
 ]
 
 _SCORING_INSTRUCTIONS: str = (
-    "Using the job posting, the candidate's general resume text, and the visa "
-    "verdict above, produce: (1) a technical-fit match score from 0 to 100 "
-    "based on skills, experience, and education; (2) matched_skills and "
-    "missing_skills lists; (3) a short, factual summary of the fit; and (4) a "
-    "recommendation of APPLY, CONSIDER, or SKIP by applying the "
-    "recommendation_rules in order. Be factual and objective — do not "
-    "inflate the score. If you recommend APPLY or CONSIDER, tailor the "
-    "resume text for this job and save it with save_resume_version "
-    "(parent_id=this resume's id, job_url=this job's url)."
+    "The job posting is NOT part of this envelope — the server no longer "
+    "fetches it. Score against the posting text present in the conversation; "
+    "if you do not have it, ask the user to paste it rather than working from "
+    "the URL alone. "
+    "Using that posting and the candidate's general resume text, produce: "
+    "(1) a technical-fit match score from 0 to 100 based on skills, "
+    "experience, and education; (2) matched_skills and missing_skills lists; "
+    "(3) a short, factual summary of the fit; and (4) a recommendation of "
+    "APPLY, CONSIDER, or SKIP by applying the recommendation_rules in order. "
+    "Be factual and objective — do not inflate the score. If you recommend "
+    "APPLY or CONSIDER, tailor the resume text for this job and save it with "
+    "save_resume_version (parent_id=this resume's id, job_url=this job's "
+    "url)."
 )
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
-
-class JobSummary(BaseModel):
-    title: str
-    company: str
-    url: str
-
-
-class VisaSummary(BaseModel):
-    verdict: str  # "GREEN" | "YELLOW" | "RED" | "UNKNOWN"
-    filings: int
-    approval_rate: float
-    error: str | None = None
 
 
 class ScoringGuide(BaseModel):
@@ -71,16 +63,17 @@ class ScoringGuide(BaseModel):
 class AnalyzeJobResult(BaseModel):
     """Decision-ready envelope of FACTS. Claude derives the score and verdict.
 
-    On success, job/visa/resume/scoring_guide are populated. The server does
-    not compute a match score or recommendation — those are left to Claude,
-    which reasons over this envelope and the scoring_guide.
+    On success, resume/scoring_guide are populated. The server does not
+    compute a match score or recommendation — those are left to Claude, which
+    reasons over this envelope and the scoring_guide.
+
+    PR1 intermediate shape: no `job` or `visa` field. Both the deleted
+    job-fetch and visa-check steps are gone from this orchestrator entirely.
     """
 
-    job: JobSummary | None = None
-    visa: VisaSummary | None = None
     resume: ResumeVersion | None = None
     scoring_guide: ScoringGuide | None = None
-    # top-level error code: no_resume | corrupt | fetch_failed
+    # top-level error code: no_resume | corrupt
     error: str | None = None
     message: str | None = None  # human-readable explanation for top-level errors
 
@@ -88,21 +81,6 @@ class AnalyzeJobResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _map_visa(visa_result: VisaResult, error: str | None = None) -> VisaSummary:
-    """Map a VisaResult to a VisaSummary for the envelope.
-
-    - verdict is uppercased (Verdict enum value → uppercase string)
-    - filings ← total_filings
-    - approval_rate passes through directly (no 'confidence' field)
-    """
-    return VisaSummary(
-        verdict=visa_result.verdict.value.upper(),
-        filings=visa_result.total_filings,
-        approval_rate=visa_result.approval_rate,
-        error=error,
-    )
 
 
 def _scoring_guide() -> ScoringGuide:
@@ -119,15 +97,10 @@ def _scoring_guide() -> ScoringGuide:
 
 
 async def analyze_job(url: str) -> AnalyzeJobResult:
-    """Gather job + visa + resume for a posting so Claude can score the match.
+    """Gather the general resume + scoring guide so Claude can score the match.
 
-    Performs the data-gathering half of a job analysis in one call:
-    1. Verifies a general resume exists (returns error envelope if not) —
-       checked BEFORE any fetch so a request that cannot be scored anyway
-       never pays for a network call.
-    2. Fetches the job posting from the given URL.
-    3. Checks H-1B visa sponsorship history for the company.
-    4. Returns the job, visa verdict, the general resume, and a scoring guide.
+    1. Verifies a general resume exists (returns error envelope if not).
+    2. Returns the general resume and a scoring guide.
 
     The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
     this tool — after calling it, score the candidate's resume against the job
@@ -141,13 +114,15 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
     This tool NEVER raises — all failures are encoded in the return envelope.
 
     Args:
-        url: The raw job posting URL to analyze.
+        url: The raw job posting URL being analyzed. Used only to exclude a
+             resume already tailored to this job from the general-resume
+             selection.
 
     Returns:
-        AnalyzeJobResult with job, visa, resume, and scoring_guide populated
-        on success, or error/message fields populated on failure.
+        AnalyzeJobResult with resume and scoring_guide populated on success,
+        or error/message fields populated on failure.
     """
-    # --- Step 1: Resume precondition (BEFORE any fetch) ---
+    # --- Step 1: Resume precondition ---
     try:
         store = _read_resumes()
         resume = _general_resume(store, for_job_url=url)
@@ -162,38 +137,8 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
             message="No resume found. Run save_resume_version first.",
         )
 
-    # --- Step 2: Fetch job posting ---
-    try:
-        job_result: JobPostingResult = fetch_job_posting(url)
-    except Exception as exc:
-        return AnalyzeJobResult(
-            error="fetch_failed",
-            message=str(exc),
-        )
-
-    job_summary = JobSummary(
-        title=job_result.title,
-        company=job_result.company,
-        url=job_result.source_url or url,
-    )
-
-    # --- Step 3: Visa check (failure → UNKNOWN, orchestration CONTINUES) ---
-    visa_summary: VisaSummary
-    try:
-        visa_result: VisaResult = check_visa_sponsorship(job_result.company)
-        visa_summary = _map_visa(visa_result)
-    except Exception as exc:
-        visa_summary = VisaSummary(
-            verdict="UNKNOWN",
-            filings=0,
-            approval_rate=0.0,
-            error=str(exc),
-        )
-
-    # --- Step 4: Hand facts + rubric to Claude for scoring ---
+    # --- Step 2: Hand facts + rubric to Claude for scoring ---
     return AnalyzeJobResult(
-        job=job_summary,
-        visa=visa_summary,
         resume=resume,
         scoring_guide=_scoring_guide(),
     )

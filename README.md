@@ -58,6 +58,25 @@ Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and
 
 > **Optional extra:** parsing Greenhouse *custom domains* needs Playwright. Most users can skip it — see [Optional: Playwright](#optional-playwright-for-javascript-heavy-job-boards).
 
+## Why runwayMCP no longer fetches job postings or checks visa sponsorship
+
+Earlier versions of this server fetched job postings from Greenhouse/Ashby/Lever
+(`fetch_job_posting`) and checked H-1B sponsorship history against USCIS data
+(`check_visa_sponsorship`). Both tools, along with the read-only `get_profile`
+migration hatch, are **removed as of this release** — not deprecated, deleted.
+
+The fetch/scrape approach was fragile by construction: every job board changes its
+markup on its own schedule, and a server that parses HTML is permanently one layout
+change away from silently returning garbage. Claude, on the other hand, already reads
+the job posting you paste into the conversation — it does not need the server to fetch
+a second copy of the same text over HTTP. The server's job is to **persist and shape
+data**, not to scrape it.
+
+This also means the H-1B visa check goes away in its current form: the country
+comparison it enabled will return as a lighter-weight, declarative check against a
+country you tell the server yourself, once that lands in a follow-up release. There is
+no server-side URL fetch involved in that either.
+
 ## Step 0 (required): save your resume
 
 **Do this once before anything else.** `analyze_job` needs a stored resume — without one

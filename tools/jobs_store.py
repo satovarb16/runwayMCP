@@ -317,7 +317,11 @@ def save_job_analysis(
     url: str,
     title: str,
     company: str,
-    visa_verdict: str,
+    # No producer left: check_visa_sponsorship was deleted, so nothing derives
+    # this. Defaulted rather than required so a caller is not pushed into
+    # inventing a verdict that would then be persisted and listed as fact.
+    # The field disappears entirely when the schema moves to SQLite.
+    visa_verdict: str = "UNKNOWN",
     score: int | None = None,
     recommendation: str | None = None,
     notes: str | None = None,

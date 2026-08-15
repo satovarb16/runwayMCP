@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runway-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "An MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,9 +20,6 @@ classifiers = [
 dependencies = [
     "mcp>=1.2,<2",
     "pydantic>=2",
-    "requests",
-    "beautifulsoup4",
-    "rapidfuzz",
     "filelock>=3.13",
 ]
 
@@ -38,12 +35,8 @@ runway-mcp = "server:main"
 dev = [
     "pytest",
     "pytest-asyncio",
-    "responses",
     "pre-commit",
     "ruff==0.15.18",
-]
-browser = [
-    "playwright>=1.40",
 ]
 
 [tool.setuptools]
