@@ -456,11 +456,13 @@ class TestServerRegistration:
         for expected in (
             "fetch_job_posting",
             "check_visa_sponsorship",
-            "setup_profile",
-            "update_profile",
             "get_profile",
         ):
             assert expected in tool_names, f"{expected} missing from tool registry"
+        for removed in ("setup_profile", "update_profile"):
+            assert removed not in tool_names, (
+                f"{removed} should have been removed (SC-17)"
+            )
 
     def test_analyze_match_no_longer_registered(self):
         import server
