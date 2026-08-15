@@ -58,28 +58,58 @@ Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and
 
 > **Optional extra:** parsing Greenhouse *custom domains* needs Playwright. Most users can skip it — see [Optional: Playwright](#optional-playwright-for-javascript-heavy-job-boards).
 
-## Step 0 (required): ingest your CV
+## Step 0 (required): save your resume
 
-**Do this once before anything else.** `analyze_job` needs a stored profile — without it
-it returns an error asking you to run this first.
+**Do this once before anything else.** `analyze_job` needs a stored resume — without one
+it returns a `no_resume` error asking you to save one first.
 
 ```
-You: "Set up my profile using my CV at /path/to/resume.pdf"
+You: "Here's my CV, save it as my general resume: /path/to/resume.pdf"
 ```
 
-**Accepted CV formats:** `.pdf` and `.docx` only.
+Claude reads your CV, drafts the resume as plain text, and saves it with
+`save_resume_version` (see [Tools](#tools) below for the full reference).
+Resume versions are **raw text, versioned, and append-only** — nothing is ever
+overwritten or deleted. The first version you save (`parent_id=None`) establishes the
+base of the tree. Later, when you decide to apply somewhere, Claude can save a version
+*tailored* for that job pointing back at an existing one (`parent_id=<some version's
+id>`, `job_url=<the job>`) without touching it — `analyze_job` never scores a job
+against a resume already rewritten for that same job, since that would just be scoring
+the resume against itself.
 
-Claude reads your CV, extracts a structured profile, and saves it locally at
-`~/.config/runway-mcp/profile.json`. Updated your CV later? Just say "Update my profile
-with my new CV at ..." to replace it.
+**Your "general" resume is the most recent version with no `job_url`** — not
+necessarily the first one. Those are the same thing until you update your CV, and
+different afterwards.
+
+Updated your CV? Save it as a new version with `parent_id` set to any existing version's
+id and **no `job_url`**. It becomes your general resume by being the most recent
+untailored one. Passing `parent_id=None` a second time is rejected — there is only ever
+one root.
+
+### Migrating from a stored profile (pre-0.2.0)
+
+If you used runwayMCP before this release, you may have a legacy structured profile at
+`~/.config/runway-mcp/profile.json`. `setup_profile` and `update_profile` are gone — the
+server no longer writes structured profiles, only versioned resume text. `get_profile()`
+still works, read-only, for exactly **one release** (removed in 0.3.0), so you can migrate:
+
+```
+You: "Read my old profile and save it as my general resume."
+Claude:
+  1. get_profile()            → your old structured profile
+  2. save_resume_version(...) → the same info, rewritten as resume text, parent_id=None
+```
+
+The server never writes to or deletes `profile.json` — once you have migrated, delete
+`~/.config/runway-mcp/profile.json` yourself.
 
 ## Usage
 
 ```
 You: "Evaluate this role for me: https://jobs.example.com/swe-123"
 Claude:
-  → analyze_job(url) — fetches job + checks visa + loads your profile
-  → scores the CV match and returns APPLY / CONSIDER / SKIP + reasoning
+  → analyze_job(url) — fetches job + checks visa + loads your general resume
+  → scores the match and returns APPLY / CONSIDER / SKIP + reasoning
 ```
 
 On first run, the server downloads USCIS H-1B data (~2MB) automatically.
@@ -128,15 +158,16 @@ Claude Code launches this server over stdio and calls its tools when relevant. Y
 
 The tools **fetch and shape data**; Claude does the reasoning. The server never calls
 back to the model (no MCP sampling), so it works on any MCP host — including Claude Code,
-which does not support sampling. Claude extracts your profile from the CV and scores the
-job-vs-profile match itself, using the rubric the tools return.
+which does not support sampling. Claude drafts and tailors your resume text itself and
+scores the job-vs-resume match using the rubric the tools return; the server only
+persists what Claude gives it.
 
 **One-call flow (recommended):**
 
 ```
 You: "Evaluate this role for me: https://jobs.example.com/swe-123"
 Claude:
-  1. analyze_job(url) → job details + visa verdict + your profile + scoring guide
+  1. analyze_job(url) → job details + visa verdict + your general resume + scoring guide
   2. [scores the match + applies the rubric] → APPLY/CONSIDER/SKIP, red flags, advice
 ```
 
@@ -146,8 +177,15 @@ Claude:
 Claude:
   1. fetch_job_posting(url)          → job title, company, country, full JD
   2. check_visa_sponsorship(company) → H-1B history, approval rate, verdict
-  3. get_profile()                   → your stored CV, to score the fit against
+  3. list_resume_versions()          → pick the newest entry with job_url: null
+  4. get_resume_version(id=<that id>) → that resume's text, to score against
 ```
+
+Steps 3–4 are what `analyze_job` does internally. Reaching for
+`get_resume_version(id="latest")` instead is the tempting shortcut and usually the wrong
+one: `"latest"` means most recently *created*, and since Claude is told to save a
+tailored version after every APPLY or CONSIDER, the newest version is typically written
+for some other job. Scoring against it skews the result.
 
 The visa check only runs for US roles — Claude skips it for positions in other countries.
 
@@ -157,22 +195,33 @@ The visa check only runs for US roles — Claude skips it for positions in other
 |------|--------|
 | `fetch_job_posting` | ✅ Working — Greenhouse, Ashby, Lever, generic fallback |
 | `check_visa_sponsorship` | ✅ Working — real USCIS FY2024 data, auto-refreshes on startup |
-| `setup_profile` | ✅ Working — saves the profile Claude extracts from your CV |
-| `update_profile` | ✅ Working — update stored CV |
-| `get_profile` | ✅ Working — returns the stored profile to score against |
 | `analyze_job` | ✅ Working — one-call data gatherer (Claude scores the match) |
+| `save_resume_version` | ✅ Working — saves a resume version (raw text, append-only) |
+| `get_resume_version` | ✅ Working — retrieves a resume version by id or "latest" |
+| `list_resume_versions` | ✅ Working — lists saved resume versions, newest first |
+| `get_profile` | ⚠️ Deprecated — read-only legacy migration hatch, removed in 0.3.0 |
+| `save_job_analysis` | ✅ Working — persists an analyzed job record (upserts by URL) |
+| `list_jobs` | ✅ Working — lists stored jobs, filterable by status, score, date |
+| `set_application_status` | ✅ Working — sets a stored job's application status |
 
 ## Tools
 
 ### `analyze_job(url: str) -> AnalyzeJobResult`
 
-One-call data gatherer. Fetches the job, checks visa sponsorship, and loads your stored profile, then returns a combined envelope plus a scoring guide. **Claude** scores the match and applies the recommendation rules — the server does not (no MCP sampling). Returns:
+One-call data gatherer. Fetches the job, checks visa sponsorship, and loads your **general resume**, then returns a combined envelope plus a scoring guide. **Claude** scores the match and applies the recommendation rules — the server does not (no MCP sampling).
+
+The general resume is selected so that it was never written for the job being analyzed:
+1. The most recently saved version with no `job_url`.
+2. If every saved version has one, the most recent root version — **excluding any tailored to this exact job**.
+3. If that leaves nothing, no resume is returned at all (see `no_resume` below).
+
+Returns:
 
 ```json
 {
   "job":     { "title": "...", "company": "...", "url": "..." },
   "visa":    { "verdict": "GREEN", "filings": 42, "approval_rate": 0.91 },
-  "profile": { "name": "...", "skills": [...], "experience": [...] },
+  "resume":  { "id": "...", "label": "...", "content": "...", "parent_id": null, "job_url": null, "created_at": "..." },
   "scoring_guide": {
     "instructions": "Score the match 0-100 and apply the rules...",
     "recommendation_rules": ["SKIP if visa RED or score < 40 ...", "..."]
@@ -185,19 +234,45 @@ One-call data gatherer. Fetches the job, checks visa sponsorship, and loads your
 - `SKIP` — visa RED or score < 40 (SKIP takes precedence)
 - `CONSIDER` — everything else
 
-Requires a stored profile (run `setup_profile` first). If no profile exists, returns a clear error.
+Requires a usable stored resume. Both error cases are checked **before** the job posting is fetched, so a request that cannot be scored anyway never pays for the network call:
 
-### `setup_profile(profile: ProfileData) -> ProfileSetupResult`
+- `error="no_resume"` — no resume was selected. Usually means you have not saved one yet, but it also fires when every stored version is tailored to this exact job, since scoring against those would inflate the match. Save an untailored version (no `job_url`) to fix it.
+- `error="corrupt"` — the resume store exists but could not be read (malformed JSON, or a permissions/path problem). The file itself is the problem; saving another version will not help.
 
-Persists a structured profile to `~/.config/runway-mcp/profile.json`. Claude reads your CV (`.pdf` or `.docx`) and extracts the `ProfileData` (name, skills, experience, education, …), then calls this tool to save it. Fails if a profile already exists — use `update_profile` to replace it. Required before `analyze_job`.
+### `save_resume_version(content: str, label: str, parent_id: str | None = None, job_url: str | None = None) -> SaveResumeVersionResult`
 
-### `update_profile(profile: ProfileData) -> ProfileSetupResult`
+Saves a new resume version as raw text. **Append-only** — no version is ever mutated or deleted, so your history is always intact. The store enforces a single-root tree:
+- The **first** version you ever save must have `parent_id=None` — this establishes your general resume.
+- Every version after that **must** set `parent_id` to an existing version's id. Passing `parent_id=None` again (or an unknown id) is rejected.
+- `job_url` is optional — set it when a version is tailored for a specific job, so `list_resume_versions(job_url=...)` and `analyze_job`'s general-resume selection can tell tailored versions apart from your general one.
 
-Same as `setup_profile` but overwrites an existing profile. Use when you update your CV.
+Returns `error="invalid_parent"` (empty store expects `parent_id=None`, non-empty store requires it) or `error="parent_not_found"` (unknown `parent_id`) on failure — no version is written in either case.
+
+### `get_resume_version(id: str) -> GetResumeVersionResult`
+
+Retrieves one resume version by its exact `id`, or the most recently *created* version via `id="latest"` (not necessarily the general one). Returns `error="not_found"` if no such version exists.
+
+### `list_resume_versions(job_url: str | None = None, limit: int | None = None) -> ListResumeVersionsResult`
+
+Lists saved resume versions **newest first**, as summaries — no `content` field, so listing 20 versions doesn't dump 20 full resumes into context. Call `get_resume_version` once you know which id you want. Filter to versions tailored for one job with `job_url`.
 
 ### `get_profile() -> GetProfileResult`
 
-Returns the stored profile so Claude can score a job against it (e.g. in the individual-tools flow). Returns a structured `no_profile` error if none is stored yet.
+**Deprecated, removed in 0.3.0.** Read-only migration hatch: returns the legacy structured profile from `~/.config/runway-mcp/profile.json` if one exists, unchanged from before this release, so Claude can re-save it as resume text via `save_resume_version`. The server never writes to or deletes `profile.json` — delete it yourself once you've migrated. Returns `error="no_profile"` if none is stored.
+
+### `save_job_analysis(url: str, title: str, company: str, visa_verdict: str, score: int | None = None, recommendation: str | None = None, notes: str | None = None) -> SaveJobResult`
+
+Persists an analyzed job record, stamped with the current time. **Upserts by `url`** — saving the same URL again updates the existing record. Any argument you omit (`score`, `recommendation`, `notes`) is left as-is on an existing record rather than cleared, so a bare re-save of a reposted listing doesn't wipe your notes. `status` defaults to `not_applied` for new records and is preserved on upsert — set it separately with `set_application_status`.
+
+### `list_jobs(since: str | None = None, status: str | list[str] | None = None, min_score: int | None = None, limit: int | None = None, sort_by: str = "analyzed_at") -> ListJobsResult`
+
+Lists stored jobs, filtered → sorted → limited. `status` takes **one status or a list of statuses** — so "what have I applied to" (`applied`, `interviewing`, `offer`, and any other status you consider "in progress") is a single call; the server doesn't define what "applied" or "active" means, the caller passes the group it means. `sort_by` is `"analyzed_at"` (default, newest first) or `"score"` (descending, unscored jobs last).
+
+### `set_application_status(url: str, status: str, notes: str | None = None) -> SetStatusResult`
+
+Sets a stored job's application status to one of the 7 values: `not_applied`, `applied`, `interviewing`, `offer`, `rejected`, `withdrawn`, `ghosted`. **Transitions are deliberately unvalidated** — any status can move to any other (e.g. `rejected` → `interviewing` succeeds), because reopened hiring processes are real and the server doesn't get to say otherwise. Returns `error="not_found"` for an unknown URL, `error="invalid_status"` for an unrecognized value (record left unchanged).
+
+**Upgrading from a pre-status `jobs.json`:** older versions stored `"applied": true/false` instead of `status`. The next time any job tool reads `~/.config/runway-mcp/jobs.json`, the server detects the old shape, writes a one-time `jobs.json.bak` backup, and migrates the file in memory (`applied: true` → `status: "applied"`, `applied: false` → `status: "not_applied"`) — no action needed on your part. The migration is only persisted to disk on the next write; a read alone never touches the file.
 
 ### `check_visa_sponsorship(company: str) -> VisaResult`
 
@@ -253,7 +328,7 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ```bash
 pytest -m contract      # fast contract tests
 pytest -m integration   # server tool registration
-pytest                  # full suite (214 tests)
+pytest                  # full suite (286 tests)
 ```
 
 ## Contributing
