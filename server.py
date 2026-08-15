@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from tools.analyze import analyze_job
 from tools.jobs import fetch_job_posting
 from tools.jobs_store import list_jobs, save_job_analysis, set_application_status
-from tools.profile import get_profile, setup_profile, update_profile
+from tools.profile import get_profile
 from tools.resumes import get_resume_version, list_resume_versions, save_resume_version
 from tools.uscis_cache import refresh_to_latest_fy
 from tools.visa import check_visa_sponsorship
@@ -33,8 +33,6 @@ mcp = FastMCP("runway-mcp")
 
 mcp.tool()(check_visa_sponsorship)
 mcp.tool()(fetch_job_posting)
-mcp.tool()(setup_profile)
-mcp.tool()(update_profile)
 mcp.tool()(get_profile)
 mcp.tool()(analyze_job)
 mcp.tool()(save_job_analysis)

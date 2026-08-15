@@ -14,12 +14,12 @@ def test_both_tools_registered():
 
 @pytest.mark.integration
 def test_profile_tools_registered():
-    """setup_profile, update_profile, get_profile must be registered."""
+    """get_profile stays registered; setup_profile/update_profile are gone (SC-17)."""
     tool_manager = server.mcp._tool_manager
     registered_names = set(tool_manager._tools.keys())
-    assert "setup_profile" in registered_names
-    assert "update_profile" in registered_names
     assert "get_profile" in registered_names
+    assert "setup_profile" not in registered_names
+    assert "update_profile" not in registered_names
 
 
 @pytest.mark.integration

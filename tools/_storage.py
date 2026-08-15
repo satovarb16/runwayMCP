@@ -5,10 +5,10 @@ the store modules (jobs_store.py and profile.py both hand-rolled it). This
 module owns filesystem I/O only — it is intentionally separate from
 tools/_utils.py, which stays pure string normalization with zero I/O.
 
-profile.py is NOT migrated to this helper — it still has its own inline
-copy of the pattern. It is deleted wholesale in a later change
-(resume-tailoring-and-status-tracking, PR6) rather than updated, so
-migrating it here would be wasted work.
+profile.py's writer functions (setup_profile, update_profile, and the
+inline mkstemp+replace helper they used) were deleted rather than migrated
+onto this helper (resume-tailoring-and-status-tracking, PR6) — profile.py
+is now read-only and performs no writes at all.
 """
 
 from __future__ import annotations
