@@ -2,13 +2,12 @@
 
 Extracted from the tempfile-mkstemp + os.replace pattern duplicated across
 the store modules (jobs_store.py and profile.py both hand-rolled it). This
-module owns filesystem I/O only — it is intentionally separate from
-tools/_utils.py, which stays pure string normalization with zero I/O.
+module owns filesystem I/O only — kept separate from pure string-normalization
+concerns (formerly tools/_utils.py, deleted in 0.3.0 PR1 along with its only
+consumers).
 
-profile.py's writer functions (setup_profile, update_profile, and the
-inline mkstemp+replace helper they used) were deleted rather than migrated
-onto this helper (resume-tailoring-and-status-tracking, PR6) — profile.py
-is now read-only and performs no writes at all.
+profile.py was deleted in full in 0.3.0 PR1 — the read-only migration hatch
+it carried (get_profile) is gone with it.
 """
 
 from __future__ import annotations

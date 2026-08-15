@@ -1,48 +1,26 @@
-"""Tests for tools/analyze.py — analyze_job orchestrator (Option A).
+"""Tests for tools/analyze.py — analyze_job orchestrator.
 
-analyze_job gathers FACTS (job, visa, resume) + a scoring guide. The match
-score and APPLY/CONSIDER/SKIP recommendation are produced by the
-conversation-side Claude, NOT the server — so this suite asserts the envelope
-contents, not a server-computed score/recommendation.
+PR1 intermediate contract (sqlite-memory-and-pasted-jd, tasks 1.1a-1.1f):
+analyze_job no longer fetches a posting or checks visa sponsorship — both
+sub-tools are deleted in this same change. The envelope keeps `resume` and
+`scoring_guide` only; `job` and `visa` are gone entirely, not merely
+unpopulated. This is NOT the final 0.3.0 contract (extracted/work_authorization
+land in PR3a) — it is the deliberate PR1 checkpoint shape.
+
+Step 1 (the resume precondition) is UNCHANGED from before this PR — those
+tests are ported verbatim to prove that.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from tools.jobs import JobPostingResult
-from tools.visa import VisaResult, Verdict
 from tools.resumes import ResumeStore, ResumeVersion
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_job_result(
-    title: str = "Backend Engineer",
-    company: str = "Acme Corp",
-    url: str = "https://example.com/job/123",
-) -> JobPostingResult:
-    return JobPostingResult(
-        title=title,
-        company=company,
-        source_url=url,
-    )
-
-
-def _make_visa_result(
-    verdict: Verdict = Verdict.GREEN,
-    total_filings: int = 15,
-    approval_rate: float = 0.92,
-) -> VisaResult:
-    return VisaResult(
-        company="Acme Corp",
-        total_filings=total_filings,
-        approval_rate=approval_rate,
-        verdict=verdict,
-    )
 
 
 def _make_resume(
@@ -68,36 +46,11 @@ def _make_resume_store(*versions: ResumeVersion) -> ResumeStore:
 
 
 # ---------------------------------------------------------------------------
-# T-01: Pydantic models
+# T-01: Pydantic models — intermediate contract
 # ---------------------------------------------------------------------------
 
 
 class TestPydanticModels:
-    """Verify model field names, types, and defaults."""
-
-    def test_job_summary_fields(self):
-        from tools.analyze import JobSummary
-
-        js = JobSummary(title="Engineer", company="Acme", url="https://example.com")
-        assert js.title == "Engineer"
-        assert js.company == "Acme"
-        assert js.url == "https://example.com"
-
-    def test_visa_summary_defaults(self):
-        from tools.analyze import VisaSummary
-
-        vs = VisaSummary(verdict="GREEN", filings=10, approval_rate=0.9)
-        assert vs.error is None
-
-    def test_visa_summary_fields(self):
-        from tools.analyze import VisaSummary
-
-        vs = VisaSummary(verdict="YELLOW", filings=5, approval_rate=0.75, error="test")
-        assert vs.verdict == "YELLOW"
-        assert vs.filings == 5
-        assert vs.approval_rate == 0.75
-        assert vs.error == "test"
-
     def test_scoring_guide_fields(self):
         from tools.analyze import ScoringGuide
 
@@ -109,15 +62,39 @@ class TestPydanticModels:
         from tools.analyze import AnalyzeJobResult
 
         result = AnalyzeJobResult()
-        assert result.job is None
-        assert result.visa is None
         assert result.resume is None
         assert result.scoring_guide is None
         assert result.error is None
         assert result.message is None
 
+    def test_analyze_job_result_has_no_job_field(self):
+        """1.1b: `job` is gone entirely, not merely unpopulated."""
+        from tools.analyze import AnalyzeJobResult
+
+        assert "job" not in AnalyzeJobResult.model_fields
+
+    def test_analyze_job_result_has_no_visa_field(self):
+        """1.1b: `visa` is gone entirely, not merely unpopulated."""
+        from tools.analyze import AnalyzeJobResult
+
+        assert "visa" not in AnalyzeJobResult.model_fields
+
+    def test_job_summary_class_removed(self):
+        import tools.analyze as analyze_mod
+
+        assert not hasattr(analyze_mod, "JobSummary")
+
+    def test_visa_summary_class_removed(self):
+        import tools.analyze as analyze_mod
+
+        assert not hasattr(analyze_mod, "VisaSummary")
+
+    def test_map_visa_helper_removed(self):
+        import tools.analyze as analyze_mod
+
+        assert not hasattr(analyze_mod, "_map_visa")
+
     def test_analyze_job_result_no_match_or_recommendation_field(self):
-        """Option A: the server no longer computes match/recommendation."""
         from tools.analyze import AnalyzeJobResult
 
         result = AnalyzeJobResult()
@@ -126,77 +103,9 @@ class TestPydanticModels:
             "Server must NOT compute a recommendation"
         )
 
-    def test_analyze_job_result_profile_field_renamed_to_resume(self):
-        """PR5: the envelope field is `resume`, `profile` must be gone."""
-        from tools.analyze import AnalyzeJobResult
-
-        result = AnalyzeJobResult()
-        assert not hasattr(result, "profile"), (
-            "`profile` field must be renamed to `resume`"
-        )
-        assert hasattr(result, "resume")
-
-    def test_analyze_job_result_no_confidence_field(self):
-        from tools.analyze import AnalyzeJobResult, VisaSummary
-
-        vs = VisaSummary(verdict="GREEN", filings=10, approval_rate=0.9)
-        assert not hasattr(vs, "confidence")
-
-        result = AnalyzeJobResult()
-        assert not hasattr(result, "confidence")
-
 
 # ---------------------------------------------------------------------------
-# T-02: Visa mapper
-# ---------------------------------------------------------------------------
-
-
-class TestVisaMapper:
-    def test_map_visa_verdict_uppercase(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result(verdict=Verdict.GREEN))
-        assert summary.verdict == "GREEN"
-
-    def test_map_visa_filings_from_total_filings(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result(total_filings=42))
-        assert summary.filings == 42
-
-    def test_map_visa_approval_rate_passthrough(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result(approval_rate=0.87))
-        assert summary.approval_rate == 0.87
-
-    def test_map_visa_no_confidence_field(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result())
-        assert not hasattr(summary, "confidence")
-
-    def test_map_visa_error_defaults_none(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result())
-        assert summary.error is None
-
-    def test_map_visa_yellow_verdict_uppercase(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result(verdict=Verdict.YELLOW))
-        assert summary.verdict == "YELLOW"
-
-    def test_map_visa_red_verdict_uppercase(self):
-        from tools.analyze import _map_visa
-
-        summary = _map_visa(_make_visa_result(verdict=Verdict.RED))
-        assert summary.verdict == "RED"
-
-
-# ---------------------------------------------------------------------------
-# T-03: Scoring guide
+# T-02: Scoring guide — visa-verdict wording stripped
 # ---------------------------------------------------------------------------
 
 
@@ -205,11 +114,7 @@ class TestScoringGuide:
         from tools.analyze import _scoring_guide
 
         guide = _scoring_guide()
-        assert len(guide.recommendation_rules) >= 3
-        combined = " ".join(guide.recommendation_rules).upper()
-        assert "SKIP" in combined
-        assert "APPLY" in combined
-        assert "CONSIDER" in combined
+        assert len(guide.recommendation_rules) >= 1
 
     def test_scoring_guide_instructions_mention_score(self):
         from tools.analyze import _scoring_guide
@@ -217,46 +122,59 @@ class TestScoringGuide:
         guide = _scoring_guide()
         assert "score" in guide.instructions.lower()
 
+    def test_scoring_guide_no_longer_references_visa(self):
+        """1.1e: the visa-verdict clause in the rubric text is now false and
+        must be struck — minimal wording fix, not a rubric redesign."""
+        from tools.analyze import _scoring_guide
+
+        guide = _scoring_guide()
+        combined = " ".join(guide.recommendation_rules).lower()
+        assert "visa" not in combined
+        assert "visa" not in guide.instructions.lower()
+
 
 # ---------------------------------------------------------------------------
-# T-04: Orchestration happy path
+# T-03: Orchestration happy path (intermediate contract)
 # ---------------------------------------------------------------------------
 
 
 class TestAnalyzeJobHappyPath:
     @pytest.mark.asyncio
-    async def test_happy_path_returns_facts_and_guide(self, monkeypatch):
+    async def test_happy_path_returns_resume_and_guide_only(self, monkeypatch):
         from tools import analyze as analyze_mod
 
         base = _make_resume()
         store = _make_resume_store(base)
         monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: _make_visa_result(
-                verdict=Verdict.GREEN, total_filings=15, approval_rate=0.92
-            ),
-        )
 
         from tools.analyze import analyze_job
 
         result = await analyze_job("https://example.com/job/123")
 
         assert result.error is None
-        assert result.job is not None
-        assert result.job.title == "Backend Engineer"
-        assert result.visa is not None
-        assert result.visa.verdict == "GREEN"
-        assert result.visa.filings == 15
-        assert result.visa.approval_rate == 0.92
         assert result.resume is not None
         assert result.resume.id == base.id
         assert result.scoring_guide is not None
-        assert len(result.scoring_guide.recommendation_rules) >= 3
+        assert not hasattr(result, "job")
+        assert not hasattr(result, "visa")
+
+    @pytest.mark.asyncio
+    async def test_happy_path_serialized_output_has_no_job_or_visa_key(
+        self, monkeypatch
+    ):
+        """1.1c: no job/visa keys anywhere in the serialized output."""
+        from tools import analyze as analyze_mod
+
+        base = _make_resume()
+        store = _make_resume_store(base)
+        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
+
+        from tools.analyze import analyze_job
+
+        result = await analyze_job("https://example.com/job/123")
+        dumped = result.model_dump()
+        assert "job" not in dumped
+        assert "visa" not in dumped
 
     @pytest.mark.asyncio
     async def test_analyze_job_never_raises(self, monkeypatch):
@@ -265,11 +183,6 @@ class TestAnalyzeJobHappyPath:
 
         store = _make_resume_store(_make_resume())
         monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
-        monkeypatch.setattr(
-            analyze_mod,
-            "fetch_job_posting",
-            lambda url: (_ for _ in ()).throw(RuntimeError("unexpected")),
-        )
 
         from tools.analyze import analyze_job
 
@@ -278,81 +191,17 @@ class TestAnalyzeJobHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# T-05: Failure paths
-# ---------------------------------------------------------------------------
-
-
-class TestFailurePaths:
-    @pytest.mark.asyncio
-    async def test_fetch_fails_stops_orchestration(self, monkeypatch):
-        """fetch raises → error='fetch_failed', visa not called."""
-        from tools import analyze as analyze_mod
-        from unittest.mock import MagicMock as MM
-
-        store = _make_resume_store(_make_resume())
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
-
-        visa_spy = MM(side_effect=lambda company: _make_visa_result())
-        monkeypatch.setattr(
-            analyze_mod,
-            "fetch_job_posting",
-            lambda url: (_ for _ in ()).throw(ValueError("page not found")),
-        )
-        monkeypatch.setattr(analyze_mod, "check_visa_sponsorship", visa_spy)
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123")
-
-        assert result.error == "fetch_failed"
-        assert "page not found" in result.message
-        assert result.visa is None
-        assert result.job is None
-        assert result.scoring_guide is None
-        visa_spy.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_visa_fails_continues_with_unknown(self, monkeypatch):
-        """visa raises → UNKNOWN verdict, envelope still returns job/resume/guide."""
-        from tools import analyze as analyze_mod
-
-        store = _make_resume_store(_make_resume())
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod,
-            "check_visa_sponsorship",
-            lambda company: (_ for _ in ()).throw(RuntimeError("USCIS down")),
-        )
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123")
-
-        assert result.visa.verdict == "UNKNOWN"
-        assert result.visa.error is not None
-        assert result.job is not None
-        assert result.resume is not None
-        assert result.scoring_guide is not None
-
-
-# ---------------------------------------------------------------------------
-# T-06: Resume precondition — SC-13, SC-14
+# T-04: Resume precondition — UNCHANGED from before this PR (ported verbatim)
 # ---------------------------------------------------------------------------
 
 
 class TestResumePrecondition:
     @pytest.mark.asyncio
-    async def test_sc14_empty_store_no_resume_error_before_fetch(self, monkeypatch):
-        """SC-14: empty resume store → error='no_resume' BEFORE the job fetch."""
+    async def test_sc14_empty_store_no_resume_error(self, monkeypatch):
+        """SC-14: empty resume store → error='no_resume'."""
         from tools import analyze as analyze_mod
-        from unittest.mock import MagicMock as MM
 
-        fetch_spy = MM(side_effect=lambda url: _make_job_result())
         monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: _make_resume_store())
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
 
         from tools.analyze import analyze_job
 
@@ -360,11 +209,8 @@ class TestResumePrecondition:
 
         assert result.error == "no_resume"
         assert result.message is not None
-        assert result.job is None
-        assert result.visa is None
         assert result.resume is None
         assert result.scoring_guide is None
-        fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_corrupt_store_is_not_reported_as_no_resume(self, monkeypatch):
@@ -375,9 +221,7 @@ class TestResumePrecondition:
         and holds nothing usable; corrupt means the file itself is the problem.
         """
         from tools import analyze as analyze_mod
-        from unittest.mock import MagicMock as MM
 
-        fetch_spy = MM(side_effect=lambda url: _make_job_result())
         monkeypatch.setattr(
             analyze_mod,
             "_read_resumes",
@@ -385,7 +229,6 @@ class TestResumePrecondition:
                 ValueError("Resume store is corrupt: bad json")
             ),
         )
-        monkeypatch.setattr(analyze_mod, "fetch_job_posting", fetch_spy)
 
         from tools.analyze import analyze_job
 
@@ -393,7 +236,6 @@ class TestResumePrecondition:
 
         assert result.error == "corrupt"
         assert "corrupt" in result.message
-        fetch_spy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sc13_envelope_carries_base_resume_not_tailored_child(
@@ -415,12 +257,6 @@ class TestResumePrecondition:
         )
         store = _make_resume_store(base, tailored_child)
         monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
-        monkeypatch.setattr(
-            analyze_mod, "fetch_job_posting", lambda url: _make_job_result()
-        )
-        monkeypatch.setattr(
-            analyze_mod, "check_visa_sponsorship", lambda company: _make_visa_result()
-        )
 
         from tools.analyze import analyze_job
 
@@ -433,7 +269,23 @@ class TestResumePrecondition:
 
 
 # ---------------------------------------------------------------------------
-# T-07: Server registration
+# T-05: fetch_failed is unreachable — the path no longer exists
+# ---------------------------------------------------------------------------
+
+
+class TestFetchFailedRemoved:
+    def test_fetch_failed_not_a_documented_error(self):
+        """1.1: error='fetch_failed' becomes unreachable and must be removed
+        from the model's error-vocabulary docstring — dead code left in place
+        would misdocument the contract."""
+        from tools.analyze import AnalyzeJobResult
+
+        docstring = AnalyzeJobResult.__doc__ or ""
+        assert "fetch_failed" not in docstring
+
+
+# ---------------------------------------------------------------------------
+# T-06: Server registration
 # ---------------------------------------------------------------------------
 
 
@@ -449,21 +301,6 @@ class TestServerRegistration:
         tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
         assert "analyze_job" in tool_names
 
-    def test_existing_tools_still_registered(self):
-        import server
-
-        tool_names = {t.name for t in server.mcp._tool_manager.list_tools()}
-        for expected in (
-            "fetch_job_posting",
-            "check_visa_sponsorship",
-            "get_profile",
-        ):
-            assert expected in tool_names, f"{expected} missing from tool registry"
-        for removed in ("setup_profile", "update_profile"):
-            assert removed not in tool_names, (
-                f"{removed} should have been removed (SC-17)"
-            )
-
     def test_analyze_match_no_longer_registered(self):
         import server
 
@@ -475,3 +312,25 @@ class TestServerRegistration:
         from tools.analyze import AnalyzeJobResult
 
         assert issubclass(AnalyzeJobResult, BaseModel)
+
+    def test_analyze_module_does_not_import_tools_jobs_or_visa(self):
+        """1.1a: partial win toward SC-51 — module-level import graph clean."""
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__)
+            .resolve()
+            .parent.parent.joinpath("tools", "analyze.py")
+            .read_text(encoding="utf-8")
+        )
+        tree = ast.parse(source)
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name)
+        assert "tools.jobs" not in imported_modules
+        assert "tools.visa" not in imported_modules
