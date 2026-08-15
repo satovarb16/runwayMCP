@@ -1,6 +1,11 @@
+import json
+from pathlib import Path
+
 import pytest
 
 import server
+
+_MANIFEST_PATH = Path(__file__).resolve().parent.parent / "manifest.json"
 
 
 @pytest.mark.integration
@@ -90,6 +95,25 @@ def test_resume_tools_registered():
     assert "save_resume_version" in registered_names
     assert "get_resume_version" in registered_names
     assert "list_resume_versions" in registered_names
+
+
+@pytest.mark.integration
+def test_manifest_tools_match_registered_tools():
+    """manifest.json's tools[] must name exactly the tools registered on the
+    FastMCP server (PR7, task 7.1) — derived from both sides so this test
+    keeps working as tools are added/removed, rather than hardcoding a
+    literal name list that would just move the staleness into the test."""
+    tool_manager = server.mcp._tool_manager
+    registered_names = set(tool_manager._tools.keys())
+
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest_names = {tool["name"] for tool in manifest["tools"]}
+
+    assert manifest_names == registered_names
+
+    stale = {"mark_applied", "setup_profile", "update_profile"}
+    assert not (stale & registered_names)
+    assert not (stale & manifest_names)
 
 
 def test_sc07_refresh_called_at_startup(monkeypatch):
