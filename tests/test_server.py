@@ -18,7 +18,9 @@ def test_analyze_job_registered():
 
 @pytest.mark.integration
 def test_analyze_match_not_registered():
-    """analyze_match was removed in Option A — replaced by get_profile + Claude."""
+    """analyze_match was removed in Option A (a pre-0.2.0 refactor); its
+    replacement, get_profile, was itself removed in 0.3.0 with no direct
+    substitute — see tests/test_removed_tools.py."""
     tool_manager = server.mcp._tool_manager
     registered_names = set(tool_manager._tools.keys())
     assert "analyze_match" not in registered_names

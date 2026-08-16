@@ -17,9 +17,6 @@ build/
 venv/
 env/
 
-# Local cache (USCIS data — not versioned, downloaded at runtime)
-~/.cache/runway-mcp/
-
 # IDE
 .vscode/
 .idea/
