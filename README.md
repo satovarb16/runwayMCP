@@ -4,7 +4,11 @@
 [![Python](https://img.shields.io/pypi/pyversions/runway-mcp.svg)](https://pypi.org/project/runway-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-An MCP server that helps international students (F-1/OPT) filter US job postings by technical fit AND visa sponsorship history — in a single call.
+runwayMCP is a memory for your job hunt. You paste a job description into the conversation;
+Claude scores it, tailors a resume, and runwayMCP remembers which jobs you applied to, what
+state each one is in, and — the part that matters most — **which resume version you sent for
+each job**. Ask "did I apply to Datadog?" months later and get back "yes, and here's the exact
+resume you sent."
 
 ## Quick install
 
@@ -56,26 +60,27 @@ pip install -e ".[dev]"
 
 Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and add `"cwd": "/path/to/runwayMCP"`.
 
-> **Optional extra:** parsing Greenhouse *custom domains* needs Playwright. Most users can skip it — see [Optional: Playwright](#optional-playwright-for-javascript-heavy-job-boards).
-
-## Why runwayMCP no longer fetches job postings or checks visa sponsorship
+<!-- historical:start -->
+## Why runwayMCP doesn't fetch job postings, and never checked visa sponsorship this way
 
 Earlier versions of this server fetched job postings from Greenhouse/Ashby/Lever
 (`fetch_job_posting`) and checked H-1B sponsorship history against USCIS data
-(`check_visa_sponsorship`). Both tools, along with the read-only `get_profile`
-migration hatch, are **removed as of this release** — not deprecated, deleted.
+(`check_visa_sponsorship`). Both tools, along with the read-only `get_profile` migration
+hatch, are **removed as of this release** — not deprecated, deleted.
 
-The fetch/scrape approach was fragile by construction: every job board changes its
-markup on its own schedule, and a server that parses HTML is permanently one layout
-change away from silently returning garbage. Claude, on the other hand, already reads
-the job posting you paste into the conversation — it does not need the server to fetch
-a second copy of the same text over HTTP. The server's job is to **persist and shape
-data**, not to scrape it.
+The fetch/scrape approach was fragile by construction: every job board changes its markup on
+its own schedule (and increasingly blocks headless scraping outright), so a server that parses
+HTML is permanently one layout change — or one anti-bot update — away from silently returning
+garbage. Claude, on the other hand, already reads the job posting you paste into the
+conversation. It does not need the server to fetch a second copy of the same text over HTTP.
+The server's job is to **persist and shape data**, not to scrape it.
 
-This also means the H-1B visa check goes away in its current form: the country
-comparison it enabled will return as a lighter-weight, declarative check against a
-country you tell the server yourself, once that lands in a follow-up release. There is
-no server-side URL fetch involved in that either.
+The USCIS H-1B sponsorship lookup went with it. It's replaced by something smaller and more
+honest: `set_work_authorization` lets you declare, once, the countries you may legally work in,
+and `analyze_job` compares each job's country against that declaration live, on every call —
+never a stored, staleness-prone verdict. See [Work authorization](#step-0b-required-declare-your-work-authorization)
+below.
+<!-- historical:end -->
 
 ## Step 0 (required): save your resume
 
@@ -90,254 +95,267 @@ Claude reads your CV, drafts the resume as plain text, and saves it with
 `save_resume_version` (see [Tools](#tools) below for the full reference).
 Resume versions are **raw text, versioned, and append-only** — nothing is ever
 overwritten or deleted. The first version you save (`parent_id=None`) establishes the
-base of the tree. Later, when you decide to apply somewhere, Claude can save a version
+base of the tree. Later, when you decide to apply somewhere, Claude saves a version
 *tailored* for that job pointing back at an existing one (`parent_id=<some version's
-id>`, `job_url=<the job>`) without touching it — `analyze_job` never scores a job
-against a resume already rewritten for that same job, since that would just be scoring
-the resume against itself.
+id>`, `job_id=<the id save_job_analysis returned for that job>`) without touching it —
+`analyze_job` never scores a job against a resume already rewritten for that same job,
+since that would just be scoring the resume against itself.
 
-**Your "general" resume is the most recent version with no `job_url`** — not
+**Your "general" resume is the most recent version with no `job_id`** — not
 necessarily the first one. Those are the same thing until you update your CV, and
 different afterwards.
 
 Updated your CV? Save it as a new version with `parent_id` set to any existing version's
-id and **no `job_url`**. It becomes your general resume by being the most recent
+id and **no `job_id`**. It becomes your general resume by being the most recent
 untailored one. Passing `parent_id=None` a second time is rejected — there is only ever
 one root.
 
-### Migrating from a stored profile (pre-0.2.0)
+## Step 0b (required): declare your work authorization
 
-If you used runwayMCP before this release, you may have a legacy structured profile at
-`~/.config/runway-mcp/profile.json`. `setup_profile` and `update_profile` are gone — the
-server no longer writes structured profiles, only versioned resume text. `get_profile()`
-still works, read-only, for exactly **one release** (removed in 0.3.0), so you can migrate:
+`analyze_job` also needs to know where you're allowed to work — without it, it returns a
+`no_work_authorization` error asking you to declare this first.
 
 ```
-You: "Read my old profile and save it as my general resume."
+You: "I can legally work in the United States and Germany."
+Claude: set_work_authorization(countries=["United States", "Germany"])
+```
+
+This **replaces** any prior declaration — it's a statement about the whole set, not an
+addition. From then on, every `analyze_job` call compares that job's country against your
+current declaration **live** (never cached, never stored on the job record) and returns one
+of three outcomes in `work_authorization.status`:
+
+- `"authorized"` — the job's country matches a declared one. No warning.
+- `"warned"` — it doesn't match. `work_authorization.warning` names both the job's country
+  and your declared list, exactly as you and the job posting stated them, so a false warning
+  caused by an unrecognized spelling is self-diagnosing.
+- `"undetermined"` — the job's country couldn't be read at all (empty, or something like
+  `"..."`). Never silently treated as authorized or as a mismatch.
+
+The warning is advisory only — it never blocks `analyze_job` from returning a result.
+
+## Usage: paste a job, don't link one
+
+runwayMCP never fetches a job posting. Paste the description into the conversation, and
+Claude extracts what it needs:
+
+```
+You: "Evaluate this for me — [paste the full job description]"
 Claude:
-  1. get_profile()            → your old structured profile
-  2. save_resume_version(...) → the same info, rewritten as resume text, parent_id=None
+  1. Extracts title, company, and country from the pasted text
+  2. analyze_job(title=..., company=..., country=..., url=<link, if you have one>)
+     → your general resume + a scoring guide + a work-authorization check
+  3. Scores the match against the posting text already in this conversation
+     → APPLY / CONSIDER / SKIP + reasoning
+  4. If APPLY or CONSIDER: tailors your resume and saves it
+     → save_job_analysis(..., jd_text=<the full posting>) returns an id
+     → save_resume_version(..., job_id=<that id>)
 ```
 
-The server never writes to or deletes `profile.json` — once you have migrated, delete
-`~/.config/runway-mcp/profile.json` yourself.
+**`url` is optional.** If the posting has no URL (a referral, a screenshot, a DM), give it a
+`custom_title` instead — a short, memorable label like `"Acme referral role"`. **You need to
+remember that title**, because unlike a URL it isn't unique: two jobs can share the same
+`custom_title`, and a later lookup by title alone can be ambiguous (`get_job` or `analyze_job`
+will refuse to guess and ask you to specify an `id` instead). Claude will remind you of this
+the first time you save a job with no URL.
 
-## Usage
+The job's full pasted text (`jd_text`) is stored only if you pass it to `save_job_analysis` —
+`analyze_job` itself never sees or stores it, and a job you analyze but never save leaves no
+trace.
+
+## Tracking applications
 
 ```
-You: "Evaluate this role for me: https://jobs.example.com/swe-123"
-Claude:
-  → analyze_job(url) — fetches job + checks visa + loads your general resume
-  → scores the match and returns APPLY / CONSIDER / SKIP + reasoning
+You: "I applied to that Datadog role."
+Claude: set_application_status(id=<job id>, status="applied")
+
+You: "Did I apply to Datadog?"
+Claude: list_jobs(company="Datadog")
+        → get_job(id=<the match>) → linked resume version summaries
+        → get_resume_version(id=<that version>) → the exact text you sent
 ```
 
-On first run, the server downloads USCIS H-1B data (~2MB) automatically.
+Application status is one of 7 values: `not_applied`, `applied`, `interviewing`, `offer`,
+`rejected`, `withdrawn`, `ghosted`. Transitions are deliberately unvalidated — any status can
+move to any other (a reopened process is real), and `list_jobs(status=...)` takes either a
+single value or a list, so "what's currently in progress" (`applied`, `interviewing`, `offer`)
+is one call, not three.
 
-## Optional: Playwright for JavaScript-heavy job boards
+## Storage and migration
 
-**You almost certainly don't need this.** It's only for parsing **Greenhouse custom
-domains** (a rare edge case). Canonical `boards.greenhouse.io`, Ashby, and Lever URLs
-always work without it. The server prints a harmless warning at startup if Playwright is
-missing — you can ignore it unless you hit a custom-domain Greenhouse URL.
+All data lives in one local SQLite database at `~/.config/runway-mcp/runway.db`. If you're
+upgrading from a pre-0.3.0 install with `jobs.json`/`resumes.json`, the **first** tool call
+after upgrading migrates both files into the database automatically — a `.bak` copy of each
+original is written first, and the JSON files themselves are left untouched. Nothing to run,
+nothing to configure.
 
-Because `uvx` runs the server in an isolated environment, installing Playwright globally
-won't reach it — you must pull in the `browser` extra so it lands in the server's env.
+If you have an even older, pre-0.2.0 `~/.config/runway-mcp/profile.json` (a structured profile
+from before resume versioning existed), it is **not** migrated automatically — the tool that
+used to read it back out, and the whole structured-profile system it belonged to, are gone in
+this release with no replacement. Read the file yourself (or ask Claude to), and save its
+content as your general resume:
 
-**If you installed via `uvx` / the plugin**, switch to a manual `.mcp.json` that requests
-the extra:
-
-```json
-{
-  "mcpServers": {
-    "runway-mcp": {
-      "command": "uvx",
-      "args": ["--from", "runway-mcp[browser]", "runway-mcp"]
-    }
-  }
-}
+```
+You: "Here's my old profile.json content — save it as my general resume text."
+Claude: save_resume_version(content=<rewritten as resume text>, label="General", parent_id=None)
 ```
 
-**If you installed from source:**
-
-```bash
-pip install -e ".[browser]"
-```
-
-Then, either way, download the browser binary once:
-
-```bash
-playwright install chromium
-```
-
----
+The server never reads, writes, or deletes `profile.json` — delete it yourself once you've
+migrated by hand.
 
 ## How it works
 
-Claude Code launches this server over stdio and calls its tools when relevant. You don't invoke the tools directly — Claude decides when to call them based on the conversation.
+Claude Code launches this server over stdio and calls its tools when relevant. You don't
+invoke the tools directly — Claude decides when to call them based on the conversation.
 
-The tools **fetch and shape data**; Claude does the reasoning. The server never calls
+The tools **persist and shape data**; Claude does the reasoning. The server never calls
 back to the model (no MCP sampling), so it works on any MCP host — including Claude Code,
-which does not support sampling. Claude drafts and tailors your resume text itself and
-scores the job-vs-resume match using the rubric the tools return; the server only
-persists what Claude gives it.
-
-**One-call flow (recommended):**
-
-```
-You: "Evaluate this role for me: https://jobs.example.com/swe-123"
-Claude:
-  1. analyze_job(url) → job details + visa verdict + your general resume + scoring guide
-  2. [scores the match + applies the rubric] → APPLY/CONSIDER/SKIP, red flags, advice
-```
-
-**Or use the individual tools directly:**
-
-```
-Claude:
-  1. fetch_job_posting(url)          → job title, company, country, full JD
-  2. check_visa_sponsorship(company) → H-1B history, approval rate, verdict
-  3. list_resume_versions()          → pick the newest entry with job_url: null
-  4. get_resume_version(id=<that id>) → that resume's text, to score against
-```
-
-Steps 3–4 are what `analyze_job` does internally. Reaching for
-`get_resume_version(id="latest")` instead is the tempting shortcut and usually the wrong
-one: `"latest"` means most recently *created*, and since Claude is told to save a
-tailored version after every APPLY or CONSIDER, the newest version is typically written
-for some other job. Scoring against it skews the result.
-
-The visa check only runs for US roles — Claude skips it for positions in other countries.
+which does not support sampling. Claude drafts and tailors your resume text itself, scores
+the job-vs-resume match using the rubric `analyze_job` returns, and decides what to save;
+the server only persists what Claude gives it.
 
 ## Status
 
 | Tool | Status |
 |------|--------|
-| `fetch_job_posting` | ✅ Working — Greenhouse, Ashby, Lever, generic fallback |
-| `check_visa_sponsorship` | ✅ Working — real USCIS FY2024 data, auto-refreshes on startup |
-| `analyze_job` | ✅ Working — one-call data gatherer (Claude scores the match) |
-| `save_resume_version` | ✅ Working — saves a resume version (raw text, append-only) |
-| `get_resume_version` | ✅ Working — retrieves a resume version by id or "latest" |
-| `list_resume_versions` | ✅ Working — lists saved resume versions, newest first |
-| `get_profile` | ⚠️ Deprecated — read-only legacy migration hatch, removed in 0.3.0 |
-| `save_job_analysis` | ✅ Working — persists an analyzed job record (upserts by URL) |
-| `list_jobs` | ✅ Working — lists stored jobs, filterable by status, score, date |
-| `set_application_status` | ✅ Working — sets a stored job's application status |
+| `analyze_job` | Working — loads your general resume, a scoring guide, and a live work-authorization check |
+| `save_job_analysis` | Working — persists an analyzed job (upserts by id, then by url) |
+| `get_job` | Working — retrieves one job by id/url/custom_title, with linked resume version summaries |
+| `list_jobs` | Working — lists stored jobs, filterable by company, status, score, date |
+| `set_application_status` | Working — sets a stored job's application status |
+| `save_resume_version` | Working — saves a resume version (raw text, append-only) |
+| `get_resume_version` | Working — retrieves a resume version by id or `"latest"` |
+| `list_resume_versions` | Working — lists saved resume versions, newest first |
+| `set_work_authorization` | Working — declares the countries you may legally work in |
 
 ## Tools
 
-### `analyze_job(url: str) -> AnalyzeJobResult`
+### `analyze_job(title: str, company: str, country: str, url: str | None = None, custom_title: str | None = None) -> AnalyzeJobResult`
 
-One-call data gatherer. Fetches the job, checks visa sponsorship, and loads your **general resume**, then returns a combined envelope plus a scoring guide. **Claude** scores the match and applies the recommendation rules — the server does not (no MCP sampling).
+Read-only — writes nothing. Loads your **general resume** and a scoring guide so Claude can
+score the match against the job posting text already in this conversation (the server never
+fetches it). Also runs a live work-authorization comparison for `country` against your current
+declaration.
 
-The general resume is selected so that it was never written for the job being analyzed:
-1. The most recently saved version with no `job_url`.
-2. If every saved version has one, the most recent root version — **excluding any tailored to this exact job**.
-3. If that leaves nothing, no resume is returned at all (see `no_resume` below).
+Preconditions, checked in order:
+- `error="no_resume"` — no usable general resume exists yet. Run `save_resume_version` first.
+- `error="no_work_authorization"` — you haven't called `set_work_authorization` yet.
+- `error="corrupt"` — the store exists but couldn't be read. Distinct from the two above:
+  telling you to run the tool that writes to the same broken file wouldn't help.
+- `error="ambiguous_custom_title"` — more than one saved job shares the `custom_title` you
+  passed; re-analyze with `url` instead, or use `get_job` with a specific `id` first.
 
-Returns:
+On success, returns:
 
 ```json
 {
-  "job":     { "title": "...", "company": "...", "url": "..." },
-  "visa":    { "verdict": "GREEN", "filings": 42, "approval_rate": 0.91 },
-  "resume":  { "id": "...", "label": "...", "content": "...", "parent_id": null, "job_url": null, "created_at": "..." },
-  "scoring_guide": {
-    "instructions": "Score the match 0-100 and apply the rules...",
-    "recommendation_rules": ["SKIP if visa RED or score < 40 ...", "..."]
-  }
+  "extracted": { "title": "...", "company": "...", "country": "...", "url": null, "custom_title": "Acme referral role" },
+  "resume": { "id": "...", "label": "...", "content": "...", "parent_id": null, "job_id": null, "created_at": "..." },
+  "scoring_guide": { "instructions": "...", "recommendation_rules": ["SKIP if the match score is below 40.", "..."] },
+  "work_authorization": { "status": "warned", "warning": "This job's country ('Germany') is not among your declared work-authorized countries (United States)." },
+  "notice": null
 }
 ```
 
-**Recommendation thresholds** (Claude applies these from the scoring guide):
-- `APPLY` — visa GREEN and score ≥ 70
-- `SKIP` — visa RED or score < 40 (SKIP takes precedence)
-- `CONSIDER` — everything else
+**Recommendation rules** (Claude applies these from `scoring_guide`):
+- `SKIP` if the match score is below 40.
+- `APPLY` if the match score is 70 or higher.
+- `CONSIDER` in every other case.
 
-Requires a usable stored resume. Both error cases are checked **before** the job posting is fetched, so a request that cannot be scored anyway never pays for the network call:
+The general resume is selected so it was never written for the job being analyzed: the most
+recently saved version with no `job_id`, or — if every version is tailored to some job — the
+most recent root version, excluding any tailored to the job you're analyzing now.
 
-- `error="no_resume"` — no resume was selected. Usually means you have not saved one yet, but it also fires when every stored version is tailored to this exact job, since scoring against those would inflate the match. Save an untailored version (no `job_url`) to fix it.
-- `error="corrupt"` — the resume store exists but could not be read (malformed JSON, or a permissions/path problem). The file itself is the problem; saving another version will not help.
+### `save_job_analysis(title: str, company: str, country: str, id: str | None = None, url: str | None = None, custom_title: str | None = None, jd_text: str | None = None, score: int | None = None, recommendation: str | None = None, notes: str | None = None) -> SaveJobResult`
 
-### `save_resume_version(content: str, label: str, parent_id: str | None = None, job_url: str | None = None) -> SaveResumeVersionResult`
+Persists an analyzed job record. At least one of `url` or `custom_title` is required — that's
+how you (or Claude) find the record again later. Resolution order: `id` given → updates that
+exact record (`error="not_found"` if unknown); no `id` but `url` matches an existing record →
+upsert by URL, unchanged semantics from prior releases (an omitted optional argument leaves
+the existing value in place, so a bare re-save never wipes your score/notes); otherwise → a
+new record. **Never matches by title** — editing a title for clarity never silently creates or
+merges a duplicate.
 
-Saves a new resume version as raw text. **Append-only** — no version is ever mutated or deleted, so your history is always intact. The store enforces a single-root tree:
-- The **first** version you ever save must have `parent_id=None` — this establishes your general resume.
-- Every version after that **must** set `parent_id` to an existing version's id. Passing `parent_id=None` again (or an unknown id) is rejected.
-- `job_url` is optional — set it when a version is tailored for a specific job, so `list_resume_versions(job_url=...)` and `analyze_job`'s general-resume selection can tell tailored versions apart from your general one.
+Setting a `url` that another job already has returns `error="duplicate_url"`; neither record
+changes. Saving without a `url` returns a `message` reminding you the `custom_title` is now the
+only handle to this record — worth surfacing to the user, since they'll need to recall it.
 
-Returns `error="invalid_parent"` (empty store expects `parent_id=None`, non-empty store requires it) or `error="parent_not_found"` (unknown `parent_id`) on failure — no version is written in either case.
+### `get_job(id: str | None = None, url: str | None = None, custom_title: str | None = None, include_description: bool = False) -> GetJobResult`
+
+Retrieves one job by exactly one of `id`, `url`, or `custom_title`. `has_description` is always
+present so you can tell a description exists without paying to load it; pass
+`include_description=True` to get the full pasted text back in `description`. Also returns the
+linked resume version **summaries** (no content) — this is the headline query: "did I apply to
+X?" → "yes, and here's the resume." Fetch the actual text with `get_resume_version`.
+
+Because `custom_title` isn't unique, matching more than one job returns `error="ambiguous"`
+naming every matching id, rather than silently picking one. Unknown id/url/custom_title →
+`error="not_found"`.
+
+### `list_jobs(since: str | None = None, status: str | list[str] | None = None, min_score: int | None = None, company: str | None = None, limit: int | None = None, sort_by: str = "analyzed_at") -> ListJobsResult`
+
+Lists stored jobs, filtered → sorted → limited. `company` is a case-insensitive substring
+match — this is the headline query, "did I apply to Acme?" `status` takes **one status or a
+list of statuses**, so "what have I applied to" (`applied`, `interviewing`, `offer`, and
+whatever else you consider active) is a single call. `sort_by` is `"analyzed_at"` (default,
+newest first) or `"score"` (descending, unscored jobs last). Job records never include the full
+pasted description (`jd_text`) — only `get_job(include_description=True)` returns it.
+
+### `set_application_status(status: str, id: str | None = None, url: str | None = None, notes: str | None = None) -> SetStatusResult`
+
+Sets a stored job's application status to one of the 7 values: `not_applied`, `applied`,
+`interviewing`, `offer`, `rejected`, `withdrawn`, `ghosted`. **Transitions are deliberately
+unvalidated** — any status can move to any other (e.g. `rejected` → `interviewing` succeeds),
+because reopened hiring processes are real and the server doesn't get to say otherwise. Prefer
+`id` over `url` — it always resolves, even for jobs saved without a URL. Returns
+`error="not_found"` for an unknown id/url, `error="invalid_status"` for an unrecognized value
+(record left unchanged).
+
+### `save_resume_version(content: str, label: str, parent_id: str | None = None, job_id: str | None = None) -> SaveResumeVersionResult`
+
+Saves a new resume version as raw text. **Append-only** — no version is ever mutated or
+deleted (enforced by the database, not just application discipline), so your history is always
+intact. The store enforces a single-root tree:
+- The **first** version you ever save must have `parent_id=None` — this establishes your
+  general resume.
+- Every version after that **must** set `parent_id` to an existing version's id. Passing
+  `parent_id=None` again (or an unknown id) is rejected.
+- `job_id` is optional — set it when a version is tailored for a specific job. It must
+  reference a job that already exists: **call `save_job_analysis` first** and pass the `id` it
+  returns. An unknown `job_id` returns `error="job_not_found"`, not a raw database error.
+
+Returns `error="invalid_parent"` (empty store expects `parent_id=None`, non-empty store
+requires it) or `error="parent_not_found"` (unknown `parent_id`) on failure — no version is
+written in either case.
 
 ### `get_resume_version(id: str) -> GetResumeVersionResult`
 
-Retrieves one resume version by its exact `id`, or the most recently *created* version via `id="latest"` (not necessarily the general one). Returns `error="not_found"` if no such version exists.
+Retrieves one resume version by its exact `id`, or the most recently *created* version via
+`id="latest"` (not necessarily the general one — if the newest version is tailored to some
+job, `"latest"` returns that). Returns `error="not_found"` if no such version exists.
 
-### `list_resume_versions(job_url: str | None = None, limit: int | None = None) -> ListResumeVersionsResult`
+### `list_resume_versions(job_id: str | None = None, limit: int | None = None) -> ListResumeVersionsResult`
 
-Lists saved resume versions **newest first**, as summaries — no `content` field, so listing 20 versions doesn't dump 20 full resumes into context. Call `get_resume_version` once you know which id you want. Filter to versions tailored for one job with `job_url`.
+Lists saved resume versions **newest first**, as summaries — no `content` field, so listing 20
+versions doesn't dump 20 full resumes into context. Call `get_resume_version` once you know
+which id you want. Filter to versions tailored for one job with `job_id` (the id
+`save_job_analysis` returned for that job).
 
-### `get_profile() -> GetProfileResult`
+### `set_work_authorization(countries: list[str]) -> SetWorkAuthorizationResult`
 
-**Deprecated, removed in 0.3.0.** Read-only migration hatch: returns the legacy structured profile from `~/.config/runway-mcp/profile.json` if one exists, unchanged from before this release, so Claude can re-save it as resume text via `save_resume_version`. The server never writes to or deletes `profile.json` — delete it yourself once you've migrated. Returns `error="no_profile"` if none is stored.
-
-### `save_job_analysis(url: str, title: str, company: str, visa_verdict: str, score: int | None = None, recommendation: str | None = None, notes: str | None = None) -> SaveJobResult`
-
-Persists an analyzed job record, stamped with the current time. **Upserts by `url`** — saving the same URL again updates the existing record. Any argument you omit (`score`, `recommendation`, `notes`) is left as-is on an existing record rather than cleared, so a bare re-save of a reposted listing doesn't wipe your notes. `status` defaults to `not_applied` for new records and is preserved on upsert — set it separately with `set_application_status`.
-
-### `list_jobs(since: str | None = None, status: str | list[str] | None = None, min_score: int | None = None, limit: int | None = None, sort_by: str = "analyzed_at") -> ListJobsResult`
-
-Lists stored jobs, filtered → sorted → limited. `status` takes **one status or a list of statuses** — so "what have I applied to" (`applied`, `interviewing`, `offer`, and any other status you consider "in progress") is a single call; the server doesn't define what "applied" or "active" means, the caller passes the group it means. `sort_by` is `"analyzed_at"` (default, newest first) or `"score"` (descending, unscored jobs last).
-
-### `set_application_status(url: str, status: str, notes: str | None = None) -> SetStatusResult`
-
-Sets a stored job's application status to one of the 7 values: `not_applied`, `applied`, `interviewing`, `offer`, `rejected`, `withdrawn`, `ghosted`. **Transitions are deliberately unvalidated** — any status can move to any other (e.g. `rejected` → `interviewing` succeeds), because reopened hiring processes are real and the server doesn't get to say otherwise. Returns `error="not_found"` for an unknown URL, `error="invalid_status"` for an unrecognized value (record left unchanged).
-
-**Upgrading from a pre-status `jobs.json`:** older versions stored `"applied": true/false` instead of `status`. The next time any job tool reads `~/.config/runway-mcp/jobs.json`, the server detects the old shape, writes a one-time `jobs.json.bak` backup, and migrates the file in memory (`applied: true` → `status: "applied"`, `applied: false` → `status: "not_applied"`) — no action needed on your part. The migration is only persisted to disk on the next write; a read alone never touches the file.
-
-### `check_visa_sponsorship(company: str) -> VisaResult`
-
-Looks up a company's H-1B petition history via the [USCIS H-1B Employer Data Hub](https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub).
-
-Returns: `company`, `total_filings`, `approval_rate` (0–1), `verdict` (green/yellow/red), `source`.
-
-**Verdict thresholds** (calibrated against FY2024 data, ~36k employers):
-- `green` — ≥ 5 filings AND approval rate ≥ 80% (active sponsor, top ~10%)
-- `yellow` — ≥ 1 filing AND approval rate ≥ 50% (has sponsored before)
-- `red` — no record or rate below threshold
-
-Data is downloaded and cached at `~/.cache/runway-mcp/uscis_h1b.csv` on first call (~2MB) and auto-refreshes to the latest FY on every server startup.
-
-### `fetch_job_posting(url: str) -> JobPostingResult`
-
-Fetches and parses a job posting from a URL.
-
-Returns: `title`, `company`, `country`, `location`, `description`, `posted_date`, `source_url`.
-
-**Supported job boards**
-
-| ATS | Canonical domain | Company custom domain | Notes |
-|-----|------------------|-----------------------|-------|
-| Greenhouse | ✅ `boards.greenhouse.io`, `job-boards.greenhouse.io` | ✅ with `[browser]` extra | Custom domains require Playwright |
-| Ashby | ✅ `jobs.ashbyhq.com` | ❌ not yet | |
-| Lever | ✅ `jobs.lever.co`, `lever.co` | ❌ not yet | |
-| Any board with `schema.org/JobPosting` markup | ✅ generic fallback | ✅ generic fallback | Quality depends on the site's markup |
-| Workday, ADP, others | ⚠️ generic fallback (best-effort) | ⚠️ generic fallback (best-effort) | Works if the page embeds JSON-LD or microdata |
-| SmartRecruiters | ❌ not yet | ❌ not yet | Has public API — planned |
-| BambooHR | ❌ not yet | ❌ not yet | Has public API — planned |
-
-**Known gaps**
-
-| Scenario | Behavior | Workaround |
-|----------|----------|------------|
-| Greenhouse custom domain without Playwright installed | Fails with an actionable error | Install `[browser]` extra |
-| Greenhouse custom domain behind bot protection | Fails — bot protection blocks even headless browsers | Use the canonical `boards.greenhouse.io` URL |
-| Lever custom domain | Unsupported | Find the `jobs.lever.co/company/uuid` URL directly |
-| Any aggregator URL (LinkedIn, Indeed, Handshake) | Unsupported | Use the URL from the "Apply" redirect |
+Declares the **full** list of countries you may legally work in — **replaces** any prior
+declaration, it does not add to it. Pass an empty list to explicitly declare you're authorized
+nowhere (distinct from never having called this tool at all — `analyze_job` treats the two
+differently). Country names are free text; the server canonicalizes common spellings (`"USA"`,
+`"United States"`, `"U.S."` all match) but never rejects an unrecognized one — it echoes back
+both the raw text you gave and the canonical form it stored, so a misread is visible
+immediately rather than causing a silent false warning later.
 
 ## Tool vs. reasoning boundary
 
-These tools only **fetch and shape data**. Claude handles all reasoning:
-- Whether to call `check_visa_sponsorship` (only for US roles)
-- How to interpret the verdict and score in context
+These tools only **persist and shape data**. Claude handles all reasoning:
+- Scoring the match between the resume and the pasted posting
+- Interpreting the work-authorization warning in context
 - Whether the role is a good fit overall
 
 This is intentional — tools that encode judgment make Claude less useful, not more.
@@ -347,7 +365,7 @@ This is intentional — tools that encode judgment make Claude less useful, not 
 ```bash
 pytest -m contract      # fast contract tests
 pytest -m integration   # server tool registration
-pytest                  # full suite (286 tests)
+pytest                  # full suite
 ```
 
 ## Contributing
@@ -356,12 +374,6 @@ pytest                  # full suite (286 tests)
 pip install -e ".[dev]"
 pre-commit install       # runs ruff lint + format before every commit
 ```
-
-Highest-value next features (in priority order):
-1. **Workday parser** — dedicated parser for better reliability on Workday boards
-2. **SmartRecruiters** — public API, clean integration
-3. **BambooHR** — public API, clean integration
-4. **Lever custom domains** — same pattern as Greenhouse custom domains
 
 PRs welcome.
 

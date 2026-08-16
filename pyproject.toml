@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "runway-mcp"
 version = "0.3.0"
-description = "An MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
+description = "An MCP server that remembers your job hunt: applications, statuses, and which resume version you sent to each job — plus a live work-authorization warning."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "satovarb" }]
-keywords = ["mcp", "visa", "sponsorship", "f-1", "opt", "job-search"]
+keywords = ["mcp", "job-search", "resume", "application-tracker", "work-authorization"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
