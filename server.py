@@ -15,6 +15,7 @@ from tools.jobs_store import (
     set_application_status,
 )
 from tools.resumes import get_resume_version, list_resume_versions, save_resume_version
+from tools.work_auth import set_work_authorization
 
 mcp = FastMCP("runway-mcp")
 
@@ -26,6 +27,7 @@ mcp.tool()(set_application_status)
 mcp.tool()(save_resume_version)
 mcp.tool()(get_resume_version)
 mcp.tool()(list_resume_versions)
+mcp.tool()(set_work_authorization)
 
 
 def main() -> None:

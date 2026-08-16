@@ -46,11 +46,32 @@ ValueError block: a corrupt or unreadable database raises from any of those
 calls and is reported as "corrupt"; "no_resume" is reported only when the
 database is readable but nothing usable was found.
 
-Work authorization (the precondition and the live country-comparison
-warning, design D7) is PR3b's — out of scope here.
+Work authorization (design D7, task 3b.1m) is Step 2, inserted between the
+resume precondition (Step 1, unchanged) and envelope-build (now Step 3):
+`_declared_authorizations()` returns None only when set_work_authorization
+has NEVER been called (never a default — defaulting to any country, e.g.
+the US, would mis-warn everyone outside it), producing
+error="no_work_authorization". A database corrupt enough to break THIS
+read is reported as "corrupt", never "no_work_authorization" — the same
+Guard-2-style distinction Step 1 already makes for the resume precondition,
+extended to this one. The comparison itself
+(`tools.work_auth._check_work_authorization`) is LIVE: computed fresh on
+every call against the CURRENT declared set, never persisted — a stored
+verdict would go stale the moment the user's authorization changes, exactly
+the mistake the deleted `visa_verdict` made.
+
+Precondition ordering, decided deliberately (not incidentally): resume
+FIRST, work-authorization SECOND. A first-time user with neither saved
+loses only the resume message on this call and gets the work-authorization
+message on the very next one — one extra round trip, not "many". Reversing
+the order was rejected because `test_sc38_empty_store_no_resume_error`
+(PR3a, pinned) already asserts "no_resume" wins when both preconditions are
+unset — an already-shipped guard this chain's "never weaken a safety test"
+rule forbids relitigating by changing behavior out from under it.
 
 Adds zero new external dependencies — the resume lookup is delegated to
-tools/resumes.py and tools/jobs_store.py.
+tools/resumes.py and tools/jobs_store.py; the work-authorization lookup and
+comparison to tools/work_auth.py.
 """
 
 from __future__ import annotations
@@ -59,6 +80,11 @@ from pydantic import BaseModel
 
 from tools.jobs_store import _find_job_id_by_url, _find_job_ids_by_custom_title
 from tools.resumes import _general_resume, ResumeVersion
+from tools.work_auth import (
+    _check_work_authorization,
+    _declared_authorizations,
+    WorkAuthorizationCheck,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +168,10 @@ class AnalyzeJobResult(BaseModel):
     extracted: ExtractedFields | None = None
     resume: ResumeVersion | None = None
     scoring_guide: ScoringGuide | None = None
+    work_authorization: WorkAuthorizationCheck | None = None
     notice: str | None = None  # e.g. "no url given, agree a custom_title"
     # top-level error code: no_resume | corrupt | ambiguous_custom_title
+    # | no_work_authorization
     error: str | None = None
     message: str | None = None  # human-readable explanation for top-level errors
 
@@ -176,8 +204,11 @@ def analyze_job(
     """Gather the general resume + scoring guide so Claude can score the match.
 
     1. Verifies a general resume exists (returns error envelope if not).
-    2. Returns the general resume, a scoring guide, and an `extracted` echo
-       of the caller's input.
+    2. Verifies work authorization has been declared at least once (returns
+       error="no_work_authorization" if not — see design D7/module docstring
+       for the precondition ordering decision).
+    3. Returns the general resume, a scoring guide, an `extracted` echo of
+       the caller's input, and a live work-authorization comparison.
 
     The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
     this tool — after calling it, score the candidate's resume against the job
@@ -198,8 +229,9 @@ def analyze_job(
     Args:
         title:        Job title, Claude-extracted from the pasted posting.
         company:      Company name, Claude-extracted.
-        country:      Free-text country, Claude-extracted. Used later (PR3b)
-                      for the work-authorization comparison.
+        country:      Free-text country, Claude-extracted. Compared against
+                      the user's declared work authorization; a mismatch
+                      populates work_authorization with an advisory warning.
         url:          The job posting URL, if any. Resolved to a job_id
                       (exact match against the jobs table) so the
                       general-resume selection can exclude a resume already
@@ -213,9 +245,10 @@ def analyze_job(
                       to guess and returns error="ambiguous_custom_title".
 
     Returns:
-        AnalyzeJobResult with extracted/resume/scoring_guide populated on
-        success, or error/message fields populated on failure
-        ("no_resume" | "corrupt" | "ambiguous_custom_title").
+        AnalyzeJobResult with extracted/resume/scoring_guide/
+        work_authorization populated on success, or error/message fields
+        populated on failure ("no_resume" | "corrupt" |
+        "ambiguous_custom_title" | "no_work_authorization").
     """
     # --- Step 1: Resolve job_id (Guard 1), then the resume precondition ---
     try:
@@ -249,7 +282,25 @@ def analyze_job(
             message="No resume found. Run save_resume_version first.",
         )
 
-    # --- Step 2: Hand facts + rubric to Claude for scoring ---
+    # --- Step 2: Work-authorization precondition (design D7, task 3b.1m) ---
+    try:
+        declared = _declared_authorizations()
+    except ValueError as exc:
+        # NOT no_work_authorization: the database exists and is unreadable
+        # or malformed. Telling the user to call set_work_authorization here
+        # sends them to a tool that will fail the same way, on the same file.
+        return AnalyzeJobResult(error="corrupt", message=str(exc))
+    if declared is None:
+        return AnalyzeJobResult(
+            error="no_work_authorization",
+            message=(
+                "No work authorization declared yet. Call "
+                "set_work_authorization with the countries you may legally "
+                "work in before analyzing a job."
+            ),
+        )
+
+    # --- Step 3: Hand facts + rubric to Claude for scoring ---
     return AnalyzeJobResult(
         extracted=ExtractedFields(
             title=title,
@@ -260,5 +311,6 @@ def analyze_job(
         ),
         resume=resume,
         scoring_guide=_scoring_guide(),
+        work_authorization=_check_work_authorization(country, declared),
         notice=_NO_URL_NOTICE if (url is None and custom_title is None) else None,
     )
