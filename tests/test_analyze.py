@@ -15,34 +15,16 @@ from __future__ import annotations
 
 import pytest
 
-from tools.resumes import ResumeStore, ResumeVersion
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_resume(
-    id: str = "base-1",
-    label: str = "Base",
-    content: str = "Jane Doe — Python engineer",
-    parent_id: str | None = None,
-    job_url: str | None = None,
-    created_at: str = "2026-01-01T00:00:00+00:00",
-) -> ResumeVersion:
-    return ResumeVersion(
-        id=id,
-        label=label,
-        content=content,
-        parent_id=parent_id,
-        job_url=job_url,
-        created_at=created_at,
-    )
+def _save_base_resume(label="Base", content="Jane Doe — Python engineer"):
+    from tools.resumes import save_resume_version
 
-
-def _make_resume_store(*versions: ResumeVersion) -> ResumeStore:
-    return ResumeStore(versions=list(versions))
+    return save_resume_version(content=content, label=label, parent_id=None)
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +122,8 @@ class TestScoringGuide:
 
 class TestAnalyzeJobHappyPath:
     @pytest.mark.asyncio
-    async def test_happy_path_returns_resume_and_guide_only(self, monkeypatch):
-        from tools import analyze as analyze_mod
-
-        base = _make_resume()
-        store = _make_resume_store(base)
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
+    async def test_happy_path_returns_resume_and_guide_only(self, db_path):
+        base = _save_base_resume()
 
         from tools.analyze import analyze_job
 
@@ -159,15 +137,9 @@ class TestAnalyzeJobHappyPath:
         assert not hasattr(result, "visa")
 
     @pytest.mark.asyncio
-    async def test_happy_path_serialized_output_has_no_job_or_visa_key(
-        self, monkeypatch
-    ):
+    async def test_happy_path_serialized_output_has_no_job_or_visa_key(self, db_path):
         """1.1c: no job/visa keys anywhere in the serialized output."""
-        from tools import analyze as analyze_mod
-
-        base = _make_resume()
-        store = _make_resume_store(base)
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
+        _save_base_resume()
 
         from tools.analyze import analyze_job
 
@@ -177,12 +149,9 @@ class TestAnalyzeJobHappyPath:
         assert "visa" not in dumped
 
     @pytest.mark.asyncio
-    async def test_analyze_job_never_raises(self, monkeypatch):
+    async def test_analyze_job_never_raises(self, db_path):
         """analyze_job must NEVER raise — all failures returned in envelope."""
-        from tools import analyze as analyze_mod
-
-        store = _make_resume_store(_make_resume())
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
+        _save_base_resume()
 
         from tools.analyze import analyze_job
 
@@ -191,18 +160,17 @@ class TestAnalyzeJobHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# T-04: Resume precondition — UNCHANGED from before this PR (ported verbatim)
+# T-04: Resume precondition — Guard 2 (no_resume vs corrupt), tasks 2.5o/2.5p.
+# The distinction is UNCHANGED in observable behavior from before this PR;
+# what changed is the call shape underneath (SQLite, collapsed single
+# try/except around url->job_id resolution + _general_resume).
 # ---------------------------------------------------------------------------
 
 
 class TestResumePrecondition:
     @pytest.mark.asyncio
-    async def test_sc14_empty_store_no_resume_error(self, monkeypatch):
-        """SC-14: empty resume store → error='no_resume'."""
-        from tools import analyze as analyze_mod
-
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: _make_resume_store())
-
+    async def test_sc14_empty_store_no_resume_error(self, db_path):
+        """SC-14: empty resume store -> error='no_resume'."""
         from tools.analyze import analyze_job
 
         result = await analyze_job("https://example.com/job/123")
@@ -213,22 +181,21 @@ class TestResumePrecondition:
         assert result.scoring_guide is None
 
     @pytest.mark.asyncio
-    async def test_corrupt_store_is_not_reported_as_no_resume(self, monkeypatch):
-        """A broken store must not be reported as "you have no resume yet".
-
-        That advice sends the user to save_resume_version, which fails on the
-        same file for the same reason. no_resume means the store is readable
-        and holds nothing usable; corrupt means the file itself is the problem.
+    async def test_corrupt_store_is_not_reported_as_no_resume(
+        self, db_path, monkeypatch
+    ):
+        """Guard 2 (task 2.5o): a broken database must not be reported as
+        "you have no resume yet". That advice sends the user to
+        save_resume_version, which fails on the same database for the same
+        reason. no_resume means the database is readable and holds nothing
+        usable; corrupt means the database itself is the problem.
         """
-        from tools import analyze as analyze_mod
+        import tools.analyze as analyze_mod
 
-        monkeypatch.setattr(
-            analyze_mod,
-            "_read_resumes",
-            lambda: (_ for _ in ()).throw(
-                ValueError("Resume store is corrupt: bad json")
-            ),
-        )
+        def _boom(job_id=None):
+            raise ValueError("Resume store is corrupt: bad data")
+
+        monkeypatch.setattr(analyze_mod, "_general_resume", _boom)
 
         from tools.analyze import analyze_job
 
@@ -238,25 +205,45 @@ class TestResumePrecondition:
         assert "corrupt" in result.message
 
     @pytest.mark.asyncio
-    async def test_sc13_envelope_carries_base_resume_not_tailored_child(
-        self, monkeypatch
+    async def test_corrupt_job_lookup_also_reported_as_corrupt_not_no_resume(
+        self, db_path, monkeypatch
     ):
-        """SC-13: with a base + a job-tailored child, the envelope carries the
-        BASE (root) resume, never the tailored child."""
-        from tools import analyze as analyze_mod
+        """Guard 2: the url->job_id resolution call is inside the same
+        try/except as _general_resume — a corrupt database surfacing there
+        must ALSO be reported as corrupt, not no_resume."""
+        import tools.analyze as analyze_mod
 
-        base = _make_resume(
-            id="base-1", job_url=None, created_at="2026-01-01T00:00:00+00:00"
+        def _boom(url):
+            raise ValueError("Jobs store is corrupt: bad data")
+
+        monkeypatch.setattr(analyze_mod, "_find_job_id_by_url", _boom)
+
+        from tools.analyze import analyze_job
+
+        result = await analyze_job("https://example.com/job/123")
+
+        assert result.error == "corrupt"
+        assert "corrupt" in result.message
+
+    @pytest.mark.asyncio
+    async def test_sc13_envelope_carries_general_resume_not_tailored_child(
+        self, db_path
+    ):
+        """SC-13: with a base + a job-tailored child, the envelope carries
+        the GENERAL resume, never the tailored child."""
+        from tools.jobs_store import save_job_analysis
+        from tools.resumes import save_resume_version
+
+        job = save_job_analysis(
+            url="https://example.com/job/123", title="X", company="Y", country="Z"
         )
-        tailored_child = _make_resume(
-            id="child-1",
+        base = _save_base_resume()
+        tailored_child = save_resume_version(
+            content="tailored",
             label="Tailored for Acme",
-            parent_id="base-1",
-            job_url="https://example.com/job/123",
-            created_at="2026-02-01T00:00:00+00:00",
+            parent_id=base.id,
+            job_id=job.id,
         )
-        store = _make_resume_store(base, tailored_child)
-        monkeypatch.setattr(analyze_mod, "_read_resumes", lambda: store)
 
         from tools.analyze import analyze_job
 
@@ -266,6 +253,74 @@ class TestResumePrecondition:
         assert result.resume is not None
         assert result.resume.id == base.id
         assert result.resume.id != tailored_child.id
+
+
+# ---------------------------------------------------------------------------
+# Guard 1, chain-wide constraint (tasks 2.5m/2.5n) — the anti-self-scoring
+# guard must stay green through analyze_job's intermediate (PR1-shaped) call
+# site, not deferred to PR3a.
+# ---------------------------------------------------------------------------
+
+
+class TestGuard1AntiSelfScoring:
+    @pytest.mark.asyncio
+    async def test_2_5m_general_resume_fallback_refuses_a_resume_tailored_to_this_job(
+        self, db_path
+    ):
+        """2.5m: equivalent of test_general_resume_fallback_refuses_a_resume_
+        tailored_to_this_job, exercised through analyze_job's intermediate
+        call site. The store contains NOTHING untailored — the only version
+        is tailored for the exact job being analyzed — so the correct
+        outcome is no_resume, never handing back the tailored version."""
+        from tools.jobs_store import save_job_analysis
+        from tools.resumes import save_resume_version
+
+        job = save_job_analysis(
+            url="https://acme.com/job/1", title="X", company="Y", country="Z"
+        )
+        save_resume_version(
+            content="tailored for acme",
+            label="Tailored",
+            parent_id=None,
+            job_id=job.id,
+        )
+
+        from tools.analyze import analyze_job
+
+        result = await analyze_job("https://acme.com/job/1")
+
+        assert result.error == "no_resume"
+        assert result.resume is None
+
+    @pytest.mark.asyncio
+    async def test_2_5n_unsaved_url_resolves_job_id_none_general_still_excludes_tailored(
+        self, db_path
+    ):
+        """2.5n negative case: a url that matches NO saved job resolves to
+        job_id=None — proving the None-only-when-no-match branch, not a
+        blanket bypass. The general resume must still be returned, and a
+        DIFFERENT job's tailored resume must still be excluded correctly."""
+        from tools.jobs_store import save_job_analysis
+        from tools.resumes import save_resume_version
+
+        other_job = save_job_analysis(
+            url="https://other.com/job/9", title="X", company="Y", country="Z"
+        )
+        base = _save_base_resume()
+        save_resume_version(
+            content="tailored for other job",
+            label="Tailored for other",
+            parent_id=base.id,
+            job_id=other_job.id,
+        )
+
+        from tools.analyze import analyze_job
+
+        # This url matches no saved job at all.
+        result = await analyze_job("https://never-saved.com/job/x")
+
+        assert result.error is None
+        assert result.resume.id == base.id
 
 
 # ---------------------------------------------------------------------------

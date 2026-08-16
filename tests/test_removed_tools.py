@@ -86,8 +86,8 @@ class TestAnalyzeImportGraph:
 
 
 # ---------------------------------------------------------------------------
-# SC-52: runtime dependency surface (partial — full satisfaction is PR2,
-# once filelock also drops out): no requests/beautifulsoup4/rapidfuzz
+# SC-52: runtime dependency surface — exactly mcp + pydantic (full
+# satisfaction, task 2.6e: filelock drops out with tools/_storage.py)
 # ---------------------------------------------------------------------------
 
 
@@ -98,12 +98,25 @@ class TestDependencySurface:
         for dep in ("requests", "beautifulsoup4", "rapidfuzz"):
             assert dep not in deps_section, f"{dep} should be removed from dependencies"
 
-    def test_filelock_still_present_pr1(self):
-        """filelock survives until PR2 — its only consumer, tools/_storage.py,
-        is not deleted until then."""
+    def test_filelock_removed_pr2(self):
+        """2.6e: filelock's only consumer, tools/_storage.py, is deleted in
+        this PR — the dependency goes with it."""
         content = _PYPROJECT_PATH.read_text(encoding="utf-8")
         deps_section = content.split("[project.urls]")[0]
-        assert "filelock" in deps_section
+        assert "filelock" not in deps_section
+
+    def test_runtime_deps_are_exactly_mcp_and_pydantic(self):
+        """SC-52, full satisfaction: the [project] dependencies list contains
+        exactly mcp and pydantic — no requests, beautifulsoup4, rapidfuzz,
+        filelock, and no browser/Playwright optional group."""
+        import tomllib
+
+        data = tomllib.loads(_PYPROJECT_PATH.read_text(encoding="utf-8"))
+        deps = data["project"]["dependencies"]
+        dep_names = {
+            d.split(">=")[0].split("<")[0].split("==")[0].strip() for d in deps
+        }
+        assert dep_names == {"mcp", "pydantic"}
 
     def test_browser_optional_group_removed(self):
         content = _PYPROJECT_PATH.read_text(encoding="utf-8")
