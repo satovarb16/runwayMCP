@@ -1,17 +1,23 @@
 """Tests for tools/analyze.py — analyze_job orchestrator.
 
-PR1 intermediate contract (sqlite-memory-and-pasted-jd, tasks 1.1a-1.1f):
-analyze_job no longer fetches a posting or checks visa sponsorship — both
-sub-tools are deleted in this same change. The envelope keeps `resume` and
-`scoring_guide` only; `job` and `visa` are gone entirely, not merely
-unpopulated. This is NOT the final 0.3.0 contract (extracted/work_authorization
-land in PR3a) — it is the deliberate PR1 checkpoint shape.
+FINAL 0.3.0 contract (sqlite-memory-and-pasted-jd, design D5, tasks 3a.2a-q):
+analyze_job receives Claude-extracted fields (title, company, country,
+optional url/custom_title) and NEVER the raw JD text — the text is already
+in Claude's context, so passing it as a tool argument would pay for it
+twice. The envelope echoes the extracted fields back as `extracted`: that
+echo is the ONLY visibility the user gets into a bad extraction now that
+every parser providing a floor of truth is gone.
 
-Step 1 (the resume precondition) is UNCHANGED from before this PR — those
-tests are ported verbatim to prove that.
+analyze_job is `def`, not `async def` — it has zero awaits, and its only
+I/O (SQLite) is blocking, so an async tool would block FastMCP's event
+loop. `work_authorization` behavior (the precondition and the live
+warning) is PR3b's — out of scope here (see tools/work_auth.py, not yet
+created).
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 
@@ -28,7 +34,42 @@ def _save_base_resume(label="Base", content="Jane Doe — Python engineer"):
 
 
 # ---------------------------------------------------------------------------
-# T-01: Pydantic models — intermediate contract
+# 3a.2a: analyze_job is `def`, not `async def`
+# ---------------------------------------------------------------------------
+
+
+class TestSyncNotAsync:
+    def test_analyze_job_is_not_a_coroutine_function(self):
+        """3a.2a (must-not-lose #2): analyze_job has zero awaits and its
+        only I/O (sqlite) is blocking — an async def would block FastMCP's
+        event loop on every store read."""
+        from tools.analyze import analyze_job
+
+        assert not inspect.iscoroutinefunction(analyze_job)
+
+    def test_calling_analyze_job_returns_a_result_directly_no_await_needed(
+        self, db_path
+    ):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+        assert result.error is None
+
+    def test_3a2k_no_other_registered_tool_is_async_def(self):
+        """3a.2k: confirms it is safe to drop pytest-asyncio/asyncio_mode —
+        analyze_job was the last async tool."""
+        import server
+
+        for tool_name, tool in server.mcp._tool_manager._tools.items():
+            fn = tool.fn
+            assert not inspect.iscoroutinefunction(fn), (
+                f"{tool_name} is still async def"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models — final contract shape
 # ---------------------------------------------------------------------------
 
 
@@ -46,35 +87,29 @@ class TestPydanticModels:
         result = AnalyzeJobResult()
         assert result.resume is None
         assert result.scoring_guide is None
+        assert result.extracted is None
         assert result.error is None
         assert result.message is None
 
     def test_analyze_job_result_has_no_job_field(self):
-        """1.1b: `job` is gone entirely, not merely unpopulated."""
         from tools.analyze import AnalyzeJobResult
 
         assert "job" not in AnalyzeJobResult.model_fields
 
     def test_analyze_job_result_has_no_visa_field(self):
-        """1.1b: `visa` is gone entirely, not merely unpopulated."""
+        """SC-37: no `visa` field or anything resembling the deleted
+        verdict shape."""
         from tools.analyze import AnalyzeJobResult
 
         assert "visa" not in AnalyzeJobResult.model_fields
 
-    def test_job_summary_class_removed(self):
-        import tools.analyze as analyze_mod
+    @pytest.mark.contract
+    def test_3a2n_analyze_job_result_has_extracted_field(self):
+        """3a.2n (contract): AnalyzeJobResult.extracted exists.
+        `.work_authorization` behavior is PR3b's — not asserted here."""
+        from tools.analyze import AnalyzeJobResult
 
-        assert not hasattr(analyze_mod, "JobSummary")
-
-    def test_visa_summary_class_removed(self):
-        import tools.analyze as analyze_mod
-
-        assert not hasattr(analyze_mod, "VisaSummary")
-
-    def test_map_visa_helper_removed(self):
-        import tools.analyze as analyze_mod
-
-        assert not hasattr(analyze_mod, "_map_visa")
+        assert "extracted" in AnalyzeJobResult.model_fields
 
     def test_analyze_job_result_no_match_or_recommendation_field(self):
         from tools.analyze import AnalyzeJobResult
@@ -87,7 +122,9 @@ class TestPydanticModels:
 
 
 # ---------------------------------------------------------------------------
-# T-02: Scoring guide — visa-verdict wording stripped
+# T-02: Scoring guide — unchanged content, still mentions the save ordering
+# (3a.2p/3a.2q, must-not-lose #5): save_job_analysis must be called BEFORE
+# save_resume_version now that job_id is a real foreign key.
 # ---------------------------------------------------------------------------
 
 
@@ -105,8 +142,6 @@ class TestScoringGuide:
         assert "score" in guide.instructions.lower()
 
     def test_scoring_guide_no_longer_references_visa(self):
-        """1.1e: the visa-verdict clause in the rubric text is now false and
-        must be struck — minimal wording fix, not a rubric redesign."""
         from tools.analyze import _scoring_guide
 
         guide = _scoring_guide()
@@ -114,82 +149,210 @@ class TestScoringGuide:
         assert "visa" not in combined
         assert "visa" not in guide.instructions.lower()
 
+    def test_sc18_scoring_guide_documents_save_job_analysis_ordering(self):
+        """3a.2p/q: the ordering (save_job_analysis before save_resume_version)
+        must be documented, or Claude will do it in the old order and hit
+        save_resume_version's job_not_found error."""
+        from tools.analyze import _scoring_guide
+
+        guide = _scoring_guide()
+        assert "save_job_analysis" in guide.instructions
+        assert "save_resume_version" in guide.instructions
+
 
 # ---------------------------------------------------------------------------
-# T-03: Orchestration happy path (intermediate contract)
+# R15/SC-33/SC-34: analyze_job receives extracted fields; it does NOT accept
+# jd_text at all — not merely ignores it.
 # ---------------------------------------------------------------------------
 
 
-class TestAnalyzeJobHappyPath:
-    @pytest.mark.asyncio
-    async def test_happy_path_returns_resume_and_guide_only(self, db_path):
-        base = _save_base_resume()
-
+class TestNoJdTextParameter:
+    def test_sc33_signature_has_no_jd_text_parameter(self):
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
+        sig = inspect.signature(analyze_job)
+        assert "jd_text" not in sig.parameters
+
+    def test_sc33_call_with_title_company_country_succeeds(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
 
         assert result.error is None
-        assert result.resume is not None
-        assert result.resume.id == base.id
-        assert result.scoring_guide is not None
-        assert not hasattr(result, "job")
-        assert not hasattr(result, "visa")
 
-    @pytest.mark.asyncio
-    async def test_happy_path_serialized_output_has_no_job_or_visa_key(self, db_path):
-        """1.1c: no job/visa keys anywhere in the serialized output."""
+    def test_sc34_passing_jd_text_is_rejected_not_silently_accepted(self, db_path):
+        """A naive implementation that accepts and ignores extra kwargs
+        would quietly let the JD travel a second time — exactly the doubled
+        payload cost D2 exists to avoid."""
         _save_base_resume()
-
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
-        dumped = result.model_dump()
-        assert "job" not in dumped
-        assert "visa" not in dumped
-
-    @pytest.mark.asyncio
-    async def test_analyze_job_never_raises(self, db_path):
-        """analyze_job must NEVER raise — all failures returned in envelope."""
-        _save_base_resume()
-
-        from tools.analyze import analyze_job
-
-        result = await analyze_job("https://example.com/job/123")
-        assert result is not None
+        with pytest.raises(TypeError):
+            analyze_job(title="SWE", company="Acme", country="USA", jd_text="some text")
 
 
 # ---------------------------------------------------------------------------
-# T-04: Resume precondition — Guard 2 (no_resume vs corrupt), tasks 2.5o/2.5p.
-# The distinction is UNCHANGED in observable behavior from before this PR;
-# what changed is the call shape underneath (SQLite, collapsed single
-# try/except around url->job_id resolution + _general_resume).
+# R16/SC-35, SC-36, SC-37: output contract
+# ---------------------------------------------------------------------------
+
+
+class TestOutputContract:
+    def test_sc35_extracted_echoes_input_fields_verbatim(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="Sr. Backend Engineer", company="Acme Corp", country="Germany"
+        )
+
+        assert result.extracted.title == "Sr. Backend Engineer"
+        assert result.extracted.company == "Acme Corp"
+        assert result.extracted.country == "Germany"
+
+    def test_sc36_no_serverside_validation_implausible_country_accepted(self, db_path):
+        """This documents the accepted risk from D2 as observable behavior,
+        not merely narrative — no plausibility check on country/title/company."""
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="Nowhereland")
+
+        assert result.error is None
+        assert result.extracted.country == "Nowhereland"
+
+    def test_sc37_envelope_has_resume_scoring_guide_extracted_and_nothing_else(
+        self, db_path
+    ):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+        dumped = result.model_dump()
+
+        assert "job" not in dumped
+        assert "visa" not in dumped
+        assert result.resume is not None
+        assert result.scoring_guide is not None
+        assert result.extracted is not None
+
+    def test_extracted_url_and_custom_title_default_to_none_when_omitted(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+
+        assert result.extracted.url is None
+        assert result.extracted.custom_title is None
+
+    def test_extracted_echoes_url_and_custom_title_when_given(self, db_path):
+        from tools.jobs_store import save_job_analysis
+
+        save_job_analysis(
+            url="https://example.com/job/123", title="X", company="Y", country="Z"
+        )
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="SWE",
+            company="Acme",
+            country="USA",
+            url="https://example.com/job/123",
+            custom_title="My referral",
+        )
+
+        assert result.extracted.url == "https://example.com/job/123"
+        assert result.extracted.custom_title == "My referral"
+
+
+# ---------------------------------------------------------------------------
+# R18/SC-39: analyze_job persists nothing.
+# ---------------------------------------------------------------------------
+
+
+class TestNoPersistence:
+    def test_sc39_analyzing_without_saving_leaves_no_trace(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+        from tools.jobs_store import list_jobs
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+        assert result.error is None
+
+        listed = list_jobs()
+        assert listed.count == 0
+
+
+# ---------------------------------------------------------------------------
+# `notice` — when url is None, the user needs to be told the custom_title
+# is the only handle to find this record later (D5's surviving obligation).
+# ---------------------------------------------------------------------------
+
+
+class TestNotice:
+    def test_notice_present_when_url_is_none(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+
+        assert result.notice is not None
+
+    def test_notice_absent_when_url_is_given(self, db_path):
+        from tools.jobs_store import save_job_analysis
+
+        save_job_analysis(
+            url="https://example.com/job/123", title="X", company="Y", country="Z"
+        )
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="SWE",
+            company="Acme",
+            country="USA",
+            url="https://example.com/job/123",
+        )
+
+        assert result.notice is None
+
+    def test_notice_absent_when_custom_title_is_given_even_without_url(self, db_path):
+        """Finding 4: a caller who already agreed a custom_title with the
+        user has already satisfied the notice's purpose — repeating it
+        would send them through a redundant round-trip."""
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="SWE", company="Acme", country="USA", custom_title="Acme referral"
+        )
+
+        assert result.notice is None
+
+
+# ---------------------------------------------------------------------------
+# T-04: Resume precondition — Guard 2 (no_resume vs corrupt). Observable
+# behavior UNCHANGED from PR2's intermediate call site; now exercised
+# through the final D5 contract.
 # ---------------------------------------------------------------------------
 
 
 class TestResumePrecondition:
-    @pytest.mark.asyncio
-    async def test_sc14_empty_store_no_resume_error(self, db_path):
-        """SC-14: empty resume store -> error='no_resume'."""
+    def test_sc38_empty_store_no_resume_error(self, db_path):
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
+        result = analyze_job(title="SWE", company="Acme", country="USA")
 
         assert result.error == "no_resume"
         assert result.message is not None
         assert result.resume is None
         assert result.scoring_guide is None
 
-    @pytest.mark.asyncio
-    async def test_corrupt_store_is_not_reported_as_no_resume(
-        self, db_path, monkeypatch
-    ):
-        """Guard 2 (task 2.5o): a broken database must not be reported as
-        "you have no resume yet". That advice sends the user to
-        save_resume_version, which fails on the same database for the same
-        reason. no_resume means the database is readable and holds nothing
-        usable; corrupt means the database itself is the problem.
-        """
+    def test_corrupt_store_is_not_reported_as_no_resume(self, db_path, monkeypatch):
+        """Guard 2: a broken database must not be reported as "you have no
+        resume yet". That advice sends the user to save_resume_version,
+        which fails on the same database for the same reason."""
         import tools.analyze as analyze_mod
 
         def _boom(job_id=None):
@@ -199,18 +362,23 @@ class TestResumePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
+        result = analyze_job(title="SWE", company="Acme", country="USA")
 
         assert result.error == "corrupt"
         assert "corrupt" in result.message
 
-    @pytest.mark.asyncio
-    async def test_corrupt_job_lookup_also_reported_as_corrupt_not_no_resume(
+    def test_corrupt_job_lookup_also_reported_as_corrupt_not_no_resume(
         self, db_path, monkeypatch
     ):
         """Guard 2: the url->job_id resolution call is inside the same
         try/except as _general_resume — a corrupt database surfacing there
         must ALSO be reported as corrupt, not no_resume."""
+        from tools.jobs_store import save_job_analysis
+
+        save_job_analysis(
+            url="https://example.com/job/123", title="X", company="Y", country="Z"
+        )
+
         import tools.analyze as analyze_mod
 
         def _boom(url):
@@ -220,17 +388,19 @@ class TestResumePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
+        result = analyze_job(
+            title="SWE",
+            company="Acme",
+            country="USA",
+            url="https://example.com/job/123",
+        )
 
         assert result.error == "corrupt"
         assert "corrupt" in result.message
 
-    @pytest.mark.asyncio
-    async def test_sc13_envelope_carries_general_resume_not_tailored_child(
-        self, db_path
-    ):
-        """SC-13: with a base + a job-tailored child, the envelope carries
-        the GENERAL resume, never the tailored child."""
+    def test_sc13_envelope_carries_general_resume_not_tailored_child(self, db_path):
+        """With a base + a job-tailored child, the envelope carries the
+        GENERAL resume, never the tailored child."""
         from tools.jobs_store import save_job_analysis
         from tools.resumes import save_resume_version
 
@@ -247,7 +417,12 @@ class TestResumePrecondition:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://example.com/job/123")
+        result = analyze_job(
+            title="X",
+            company="Y",
+            country="Z",
+            url="https://example.com/job/123",
+        )
 
         assert result.error is None
         assert result.resume is not None
@@ -256,22 +431,19 @@ class TestResumePrecondition:
 
 
 # ---------------------------------------------------------------------------
-# Guard 1, chain-wide constraint (tasks 2.5m/2.5n) — the anti-self-scoring
-# guard must stay green through analyze_job's intermediate (PR1-shaped) call
-# site, not deferred to PR3a.
+# Guard 1, chain-wide constraint, FINAL FORM (task 3a.2m) — the anti-self-
+# scoring guard must stay green through analyze_job's final D5 call site.
+# Same guard as 2.5m/2.5n, now exercised with url as an OPTIONAL parameter.
 # ---------------------------------------------------------------------------
 
 
 class TestGuard1AntiSelfScoring:
-    @pytest.mark.asyncio
-    async def test_2_5m_general_resume_fallback_refuses_a_resume_tailored_to_this_job(
+    def test_3a2m_general_resume_fallback_refuses_a_resume_tailored_to_this_job(
         self, db_path
     ):
-        """2.5m: equivalent of test_general_resume_fallback_refuses_a_resume_
-        tailored_to_this_job, exercised through analyze_job's intermediate
-        call site. The store contains NOTHING untailored — the only version
-        is tailored for the exact job being analyzed — so the correct
-        outcome is no_resume, never handing back the tailored version."""
+        """The store contains NOTHING untailored — the only version is
+        tailored for the exact job being analyzed — so the correct outcome
+        is no_resume, never handing back the tailored version."""
         from tools.jobs_store import save_job_analysis
         from tools.resumes import save_resume_version
 
@@ -287,19 +459,19 @@ class TestGuard1AntiSelfScoring:
 
         from tools.analyze import analyze_job
 
-        result = await analyze_job("https://acme.com/job/1")
+        result = analyze_job(
+            title="X", company="Y", country="Z", url="https://acme.com/job/1"
+        )
 
         assert result.error == "no_resume"
         assert result.resume is None
 
-    @pytest.mark.asyncio
-    async def test_2_5n_unsaved_url_resolves_job_id_none_general_still_excludes_tailored(
+    def test_3a2m_unsaved_url_resolves_job_id_none_general_still_excludes_tailored(
         self, db_path
     ):
-        """2.5n negative case: a url that matches NO saved job resolves to
+        """Negative case: a url that matches NO saved job resolves to
         job_id=None — proving the None-only-when-no-match branch, not a
-        blanket bypass. The general resume must still be returned, and a
-        DIFFERENT job's tailored resume must still be excluded correctly."""
+        blanket bypass."""
         from tools.jobs_store import save_job_analysis
         from tools.resumes import save_resume_version
 
@@ -317,10 +489,91 @@ class TestGuard1AntiSelfScoring:
         from tools.analyze import analyze_job
 
         # This url matches no saved job at all.
-        result = await analyze_job("https://never-saved.com/job/x")
+        result = analyze_job(
+            title="A", company="B", country="C", url="https://never-saved.com/job/x"
+        )
 
         assert result.error is None
         assert result.resume.id == base.id
+
+    def test_guard1_holds_when_url_is_omitted_entirely(self, db_path):
+        """3a.2m applies equally when url is None (no DB lookup at all) —
+        job_id must be None, and the general resume must still be returned,
+        excluding any job-tailored resume."""
+        from tools.jobs_store import save_job_analysis
+        from tools.resumes import save_resume_version
+
+        other_job = save_job_analysis(
+            url="https://other.com/job/9", title="X", company="Y", country="Z"
+        )
+        base = _save_base_resume()
+        save_resume_version(
+            content="tailored for other job",
+            label="Tailored for other",
+            parent_id=base.id,
+            job_id=other_job.id,
+        )
+
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="A", company="B", country="C")
+
+        assert result.error is None
+        assert result.resume.id == base.id
+
+    def test_guard1_holds_when_url_absent_but_custom_title_given(self, db_path):
+        """Findings 1(b)/2: a job saved WITHOUT a url (only custom_title) is
+        the exact case _NO_URL_NOTICE exists for. Concrete failure this
+        guards against: only a root resume tailored for referral job R
+        exists; re-analyzing R by custom_title alone (still no url) must
+        NOT hand back that self-tailored resume — it must resolve
+        custom_title -> job_id just like url does, so the exclusion still
+        fires."""
+        from tools.jobs_store import save_job_analysis
+        from tools.resumes import save_resume_version
+
+        job = save_job_analysis(
+            custom_title="Acme referral", title="X", company="Y", country="Z"
+        )
+        save_resume_version(
+            content="tailored for acme referral",
+            label="Tailored",
+            parent_id=None,
+            job_id=job.id,
+        )
+
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="X", company="Y", country="Z", custom_title="Acme referral"
+        )
+
+        assert result.error == "no_resume"
+        assert result.resume is None
+
+    def test_ambiguous_custom_title_refuses_to_guess(self, db_path):
+        """custom_title is NOT unique — when it resolves to more than one
+        job, silently picking one would risk arming the guard for the wrong
+        job (or not arming it at all). This must be an explicit, distinct
+        error, not a silent fallthrough to job_id=None."""
+        from tools.jobs_store import save_job_analysis
+
+        save_job_analysis(
+            custom_title="Acme referral", title="X1", company="Y", country="Z"
+        )
+        save_job_analysis(
+            custom_title="Acme referral", title="X2", company="Y", country="Z"
+        )
+        _save_base_resume()
+
+        from tools.analyze import analyze_job
+
+        result = analyze_job(
+            title="X2", company="Y", country="Z", custom_title="Acme referral"
+        )
+
+        assert result.error == "ambiguous_custom_title"
+        assert result.resume is None
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +583,6 @@ class TestGuard1AntiSelfScoring:
 
 class TestFetchFailedRemoved:
     def test_fetch_failed_not_a_documented_error(self):
-        """1.1: error='fetch_failed' becomes unreachable and must be removed
-        from the model's error-vocabulary docstring — dead code left in place
-        would misdocument the contract."""
         from tools.analyze import AnalyzeJobResult
 
         docstring = AnalyzeJobResult.__doc__ or ""
@@ -369,7 +619,7 @@ class TestServerRegistration:
         assert issubclass(AnalyzeJobResult, BaseModel)
 
     def test_analyze_module_does_not_import_tools_jobs_or_visa(self):
-        """1.1a: partial win toward SC-51 — module-level import graph clean."""
+        """Partial win toward SC-51 — module-level import graph clean."""
         import ast
         from pathlib import Path
 

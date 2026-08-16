@@ -8,13 +8,19 @@ if hasattr(sys.stdin, "reconfigure"):
 from mcp.server.fastmcp import FastMCP
 
 from tools.analyze import analyze_job
-from tools.jobs_store import list_jobs, save_job_analysis, set_application_status
+from tools.jobs_store import (
+    get_job,
+    list_jobs,
+    save_job_analysis,
+    set_application_status,
+)
 from tools.resumes import get_resume_version, list_resume_versions, save_resume_version
 
 mcp = FastMCP("runway-mcp")
 
 mcp.tool()(analyze_job)
 mcp.tool()(save_job_analysis)
+mcp.tool()(get_job)
 mcp.tool()(list_jobs)
 mcp.tool()(set_application_status)
 mcp.tool()(save_resume_version)

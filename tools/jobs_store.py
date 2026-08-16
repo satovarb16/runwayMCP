@@ -26,6 +26,7 @@ from enum import Enum
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tools._db import connect, _normalize_timestamp
+from tools.resumes import ResumeVersionSummary
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -93,6 +94,22 @@ class ListJobsResult(BaseModel):
     error_message: str | None = None
 
 
+class GetJobResult(BaseModel):
+    """Return value for get_job (D6)."""
+
+    success: bool
+    job: StoredJob | None = None
+    description: str | None = None
+    has_description: bool = False  # ALWAYS present — the affordance that
+    # makes the jd_text opt-in discoverable without dragging it into
+    # context by default (include_description=False is the default).
+    resume_versions: list[ResumeVersionSummary] = []
+    # "not_found" | "invalid_input" | "corrupt" | "ambiguous" (custom_title
+    # matched more than one job — see get_job's docstring)
+    error: str | None = None
+    message: str | None = None
+
+
 class SetStatusResult(BaseModel):
     """Return value for set_application_status."""
 
@@ -124,6 +141,20 @@ def _find_job_by_url(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQLite LIKE metacharacters so a caller's literal string is
+    matched literally, only the surrounding `%%` wildcards added by the
+    caller are wildcards.
+
+    Without this, `list_jobs(company="A_B")` would match "AxB" (`_` matches
+    any single character) and `list_jobs(company="%")` would match every
+    row while still reporting a filtered result — both silent, both wrong.
+    The escape character `\\` must itself be escaped first, or a caller's
+    literal backslash would be misread as escaping the character after it.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _find_job_id_by_url(url: str) -> str | None:
     """Resolve a job url to its surrogate id via an exact match (url is UNIQUE).
 
@@ -147,6 +178,33 @@ def _find_job_id_by_url(url: str) -> str | None:
     with connect() as conn:
         row = conn.execute("SELECT id FROM jobs WHERE url = ?", (url,)).fetchone()
     return row["id"] if row is not None else None
+
+
+def _find_job_ids_by_custom_title(custom_title: str) -> list[str]:
+    """Resolve a custom_title to every job id sharing it, exact match.
+
+    `custom_title` is NOT unique — `save_job_analysis` deliberately never
+    matches an existing record by `custom_title` (R3/SC-08), so re-saving
+    under the same title creates a second row. Callers that need a single
+    job (analyze.py's Guard 1 resolution, get_job's custom_title lookup)
+    MUST look at the length of the returned list and decide explicitly what
+    to do with 0, 1, or >1 matches — silently taking the first would hide a
+    genuine ambiguity from the caller.
+
+    Args:
+        custom_title: The exact custom_title to look up.
+
+    Returns:
+        A list of matching job ids — possibly empty, possibly more than one.
+
+    Raises:
+        ValueError: on a corrupt or unreadable database.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE custom_title = ?", (custom_title,)
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +440,7 @@ def list_jobs(
     since: str | None = None,
     status: str | list[str] | None = None,
     min_score: int | None = None,
+    company: str | None = None,
     limit: int | None = None,
     sort_by: str = "analyzed_at",
 ) -> ListJobsResult:
@@ -390,13 +449,15 @@ def list_jobs(
     Pipeline order: FILTER -> SORT -> LIMIT, expressed as WHERE/ORDER BY/
     LIMIT (D9). Arguments are validated in Python BEFORE any SQL is built, so
     an invalid status still produces the "use one of: ..." message rather
-    than a raw SQL error. `company` filtering is PR3a's, not this function's.
-    This tool NEVER raises.
+    than a raw SQL error. This tool NEVER raises.
 
     Args:
         since:     ISO-8601 string cutoff (inclusive).
         status:    One ApplicationStatus value, or a list to match any member.
         min_score: Minimum score threshold (inclusive). None scores excluded.
+        company:   Substring match against company, case-insensitive
+                    (COLLATE NOCASE, ASCII-only). This is SC-1, the release's
+                    headline query ("did I apply to Acme?") — D9.
         limit:     Maximum number of records to return (after sort).
         sort_by:   "analyzed_at" (default, newest first) or "score"
                    (descending, None scores last).
@@ -407,6 +468,10 @@ def list_jobs(
     """
     where_clauses: list[str] = []
     params: list[object] = []
+
+    if company is not None:
+        where_clauses.append("company LIKE ? ESCAPE '\\' COLLATE NOCASE")
+        params.append(f"%{_escape_like(company)}%")
 
     if since is not None:
         try:
@@ -570,3 +635,148 @@ def set_application_status(
             )
     except ValueError as exc:
         return SetStatusResult(success=False, error="corrupt", message=str(exc))
+
+
+def get_job(
+    id: str | None = None,
+    url: str | None = None,
+    custom_title: str | None = None,
+    include_description: bool = False,
+) -> GetJobResult:
+    """Retrieve a single job record by id, url, or custom_title (D6, the
+    REQUIRED read path for jd_text — without this tool, jd_text is
+    write-only).
+
+    `custom_title` exists as a lookup key because it exists as a SAVE
+    affordance: a job saved without a `url` is findable ONLY by the
+    `custom_title` the user agreed to (analyze.py's `_NO_URL_NOTICE`
+    promises exactly this). Without this parameter, that promise had no
+    retrieval path at all — a caller could only dump every job via
+    `list_jobs` and eyeball it.
+
+    `custom_title` is NOT unique (`save_job_analysis` deliberately never
+    matches an existing record by it — R3/SC-08), so a lookup CAN match more
+    than one job. Silently returning the first match would hide that
+    ambiguity from the caller and could resolve to the wrong job. Instead:
+    0 matches -> `not_found`; exactly 1 -> that job; more than 1 ->
+    `error="ambiguous"`, naming every matching id so the caller can retry
+    with a specific `id`.
+
+    `has_description` is ALWAYS present in the response, regardless of
+    `include_description` — it is the affordance that makes the jd_text
+    opt-in discoverable without dragging JD text into context by default.
+    Also returns the linked resume version SUMMARIES (no content) — the
+    headline query is "did I apply to X?" -> "yes, and with this resume."
+    (SC-22). The full text still comes from get_resume_version.
+
+    This tool NEVER raises.
+
+    Args:
+        id:                   Job id. Exactly one of id/url/custom_title
+                               must be given.
+        url:                  Alternate lookup key (url is UNIQUE).
+        custom_title:         Alternate lookup key for a URL-less job. NOT
+                               unique — see above for the multi-match rule.
+        include_description:  When True and a description was captured,
+                               populates `description` with the full pasted
+                               JD text. Defaults to False so a routine status
+                               check does not drag JD text into context.
+
+    Returns:
+        GetJobResult with success=True, job, description, has_description,
+        resume_versions on success; success=False with
+        error="not_found" | "invalid_input" | "corrupt" | "ambiguous" on
+        failure.
+    """
+    handles_given = sum(1 for h in (id, url, custom_title) if h is not None)
+    if handles_given != 1:
+        return GetJobResult(
+            success=False,
+            error="invalid_input",
+            message="Provide exactly one of 'id', 'url', or 'custom_title'.",
+        )
+
+    try:
+        with connect() as conn:
+            if id is not None:
+                row = _find_job_by_id(conn, id)
+                lookup_key, lookup_value = "id", id
+            elif url is not None:
+                row = _find_job_by_url(conn, url)
+                lookup_key, lookup_value = "url", url
+            else:
+                # Query directly against the already-open `conn` rather than
+                # calling `_find_job_ids_by_custom_title` (which opens its
+                # own connection) — avoids a needless nested connection
+                # while this one is already held open.
+                matching_ids = [
+                    r["id"]
+                    for r in conn.execute(
+                        "SELECT id FROM jobs WHERE custom_title = ?",
+                        (custom_title,),
+                    ).fetchall()
+                ]
+                if len(matching_ids) > 1:
+                    return GetJobResult(
+                        success=False,
+                        error="ambiguous",
+                        message=(
+                            f"{len(matching_ids)} jobs share custom_title "
+                            f"{custom_title!r} (ids: {matching_ids}). Pass "
+                            f"one of those as 'id' to disambiguate."
+                        ),
+                    )
+                row = _find_job_by_id(conn, matching_ids[0]) if matching_ids else None
+                lookup_key, lookup_value = "custom_title", custom_title
+
+            if row is None:
+                return GetJobResult(
+                    success=False,
+                    error="not_found",
+                    message=f"No job exists with {lookup_key} {lookup_value!r}.",
+                )
+
+            job = _row_to_stored_job(row)
+
+            desc_row = conn.execute(
+                "SELECT jd_text FROM job_descriptions WHERE job_id = ?", (job.id,)
+            ).fetchone()
+            has_description = desc_row is not None
+            description = (
+                desc_row["jd_text"]
+                if (include_description and desc_row is not None)
+                else None
+            )
+
+            # Explicit summary columns, not `SELECT *` (finding 5): this
+            # runs on the DEFAULT include_description=False path too, so a
+            # SELECT * here would pull every linked version's full `content`
+            # (often the largest column in the schema) just to build
+            # summaries that discard it — the same context-cost principle
+            # the job_descriptions side table exists to enforce for jd_text.
+            version_rows = conn.execute(
+                "SELECT id, label, parent_id, job_id, created_at "
+                "FROM resume_versions WHERE job_id = ? ORDER BY created_at DESC",
+                (job.id,),
+            ).fetchall()
+    except ValueError as exc:
+        return GetJobResult(success=False, error="corrupt", message=str(exc))
+
+    resume_versions = [
+        ResumeVersionSummary(
+            id=r["id"],
+            label=r["label"],
+            parent_id=r["parent_id"],
+            job_id=r["job_id"],
+            created_at=r["created_at"],
+        )
+        for r in version_rows
+    ]
+
+    return GetJobResult(
+        success=True,
+        job=job,
+        description=description,
+        has_description=has_description,
+        resume_versions=resume_versions,
+    )

@@ -56,8 +56,12 @@
       "description": "Persist an analyzed job's title, company, visa verdict, score, and recommendation. Upserts by URL."
     },
     {
+      "name": "get_job",
+      "description": "Retrieve a single stored job by id, url, or custom_title, with linked resume version summaries. include_description=True also returns the full pasted job description."
+    },
+    {
       "name": "list_jobs",
-      "description": "List stored job records, optionally filtered by application status (one value or a list), minimum score, or date, sorted and limited."
+      "description": "List stored job records, optionally filtered by company (substring match), application status (one value or a list), minimum score, or date, sorted and limited."
     },
     {
       "name": "set_application_status",

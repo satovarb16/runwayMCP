@@ -1,27 +1,53 @@
 """Orchestrator tool: analyze_job.
 
-PR1 intermediate state (sqlite-memory-and-pasted-jd, target 0.3.0): this is
-NOT the final 0.3.0 contract and NOT the pre-0.3.0 contract. `fetch_job_posting`
-and `check_visa_sponsorship` are deleted in this same change, so the job-fetch
-and visa-check steps are removed from this orchestrator entirely — not
-stubbed, not caught-and-ignored. The envelope now carries only the caller's
-general resume and the scoring rubric. The final contract (Claude-extracted
-`title`/`company`/`country` in, `extracted`/`work_authorization` out, `def`
-not `async def`) lands in PR3a once the SQLite-backed stores and the pasted-JD
-input contract are in place.
+FINAL 0.3.0 contract (sqlite-memory-and-pasted-jd, design D5). Claude reads
+the job description pasted into the conversation, extracts `title`,
+`company`, `country` (plus optional `url`/`custom_title`), and passes those
+— the raw JD text is NEVER a parameter of this tool. The text is already in
+Claude's context; accepting it here would make it travel a second time as
+call payload, for text the server cannot use (every parser that provided a
+floor of truth is deleted). The text reaches the server exactly once, at
+save_job_analysis, and only for jobs the user decides to keep.
 
-PR2 (SQLite) guard-preservation edit, tasks 2.5l/2.5o: Step 1 is still
-PR1-shaped (raw `url: str` in) but now resolves that `url` to a `job_id` via
-an exact lookup against the SQLite `jobs` table before calling the rewritten,
-job_id-keyed `_general_resume`. `job_id=None` is passed ONLY when no job row
-matches the url — the same answer a full job lookup would give for a job
-that was never saved, not a blanket bypass of the anti-self-scoring guard
-(Guard 1, SC-21). The `no_resume`/`corrupt` distinction (Guard 2) is
-preserved by wrapping both the url->job_id resolution and the
-_general_resume call in a single try/except ValueError block: a corrupt or
-unreadable database raises from either call and is reported as "corrupt";
-"no_resume" is reported only when the database is readable but nothing
-usable was found.
+Two consequences accepted at the design-decision level (obs #368): there is
+NO server-side validation of Claude's extraction — a wrong company or
+country is not detected here; and a job analyzed but never saved leaves no
+trace of its text. The envelope's `extracted` echo is the only mitigation:
+it does not detect a bad extraction, it makes one VISIBLE to the only party
+who can catch it.
+
+`analyze_job` is `def`, not `async def`: it has zero awaits, and its only
+I/O (SQLite reads) is blocking — an async tool runs on FastMCP's event loop
+and would block it on every store read; sync tools run on the worker pool,
+where every other store tool already runs.
+
+Guard 1 (anti-self-scoring, SC-21) resolution, carried forward from PR2's
+tasks 2.5l/2.5n and now adapted to `url` being OPTIONAL (task 3a.2j): when
+`url` is given, it is resolved to a `job_id` via an exact lookup against the
+`jobs` table before calling the job_id-keyed `_general_resume`. When `url`
+is absent but `custom_title` is given, the SAME resolution happens against
+`custom_title` instead — a job saved without a `url` (the referral case
+`_NO_URL_NOTICE` exists for) is still resolvable, so the guard stays armed
+on that path too; a naive "no url -> job_id=None always" reading of an
+earlier revision of this docstring was WRONG for exactly this case: it
+would silently hand back a job's own tailored resume when that job is
+re-analyzed by custom_title alone, the precise self-scoring inflation this
+guard exists to prevent. `job_id` is None only when neither `url` nor
+`custom_title` is given, or the one given matches no saved job — never a
+blanket bypass. `custom_title` is NOT unique (see jobs_store.py's
+`_find_job_ids_by_custom_title`); when it resolves to more than one job,
+this tool refuses to guess and returns `error="ambiguous_custom_title"`
+rather than silently picking one (which could arm the guard for the wrong
+job, or fail to arm it for the right one).
+
+Guard 2 (no_resume vs corrupt) is preserved by wrapping the url/custom_title
+-> job_id resolution and the _general_resume call in a single try/except
+ValueError block: a corrupt or unreadable database raises from any of those
+calls and is reported as "corrupt"; "no_resume" is reported only when the
+database is readable but nothing usable was found.
+
+Work authorization (the precondition and the live country-comparison
+warning, design D7) is PR3b's — out of scope here.
 
 Adds zero new external dependencies — the resume lookup is delegated to
 tools/resumes.py and tools/jobs_store.py.
@@ -31,7 +57,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from tools.jobs_store import _find_job_id_by_url
+from tools.jobs_store import _find_job_id_by_url, _find_job_ids_by_custom_title
 from tools.resumes import _general_resume, ResumeVersion
 
 
@@ -63,6 +89,16 @@ _SCORING_INSTRUCTIONS: str = (
     "rejects an id that does not yet exist."
 )
 
+_NO_URL_NOTICE: str = (
+    "No url was given for this job. Agree a memorable custom_title with the "
+    "user now and tell them it is how they will find this record again "
+    "later — pass it to save_job_analysis as custom_title."
+)
+# Shown only when NEITHER url NOR custom_title is present — a caller who
+# already supplied custom_title has already agreed a handle; repeating the
+# notice would send them through a redundant round-trip over one already in
+# hand (finding 4).
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -76,20 +112,38 @@ class ScoringGuide(BaseModel):
     recommendation_rules: list[str]
 
 
+class ExtractedFields(BaseModel):
+    """Verbatim echo of analyze_job's Claude-extracted input (design D5).
+
+    Every parser that provided a floor of truth on these fields is deleted;
+    this echo is the ONLY visibility the user gets into a bad extraction. No
+    normalization or reformatting is applied here — that would defeat the
+    purpose of showing exactly what was received.
+    """
+
+    title: str
+    company: str
+    country: str
+    url: str | None = None
+    custom_title: str | None = None
+
+
 class AnalyzeJobResult(BaseModel):
     """Decision-ready envelope of FACTS. Claude derives the score and verdict.
 
-    On success, resume/scoring_guide are populated. The server does not
-    compute a match score or recommendation — those are left to Claude, which
-    reasons over this envelope and the scoring_guide.
+    On success, extracted/resume/scoring_guide are populated. The server
+    does not compute a match score or recommendation — those are left to
+    Claude, which reasons over this envelope and the scoring_guide.
 
-    PR1 intermediate shape: no `job` or `visa` field. Both the deleted
-    job-fetch and visa-check steps are gone from this orchestrator entirely.
+    No `job` or `visa` field — both the deleted job-fetch and visa-check
+    steps are gone from this orchestrator entirely.
     """
 
+    extracted: ExtractedFields | None = None
     resume: ResumeVersion | None = None
     scoring_guide: ScoringGuide | None = None
-    # top-level error code: no_resume | corrupt
+    notice: str | None = None  # e.g. "no url given, agree a custom_title"
+    # top-level error code: no_resume | corrupt | ambiguous_custom_title
     error: str | None = None
     message: str | None = None  # human-readable explanation for top-level errors
 
@@ -112,35 +166,77 @@ def _scoring_guide() -> ScoringGuide:
 # ---------------------------------------------------------------------------
 
 
-async def analyze_job(url: str) -> AnalyzeJobResult:
+def analyze_job(
+    title: str,
+    company: str,
+    country: str,
+    url: str | None = None,
+    custom_title: str | None = None,
+) -> AnalyzeJobResult:
     """Gather the general resume + scoring guide so Claude can score the match.
 
     1. Verifies a general resume exists (returns error envelope if not).
-    2. Returns the general resume and a scoring guide.
+    2. Returns the general resume, a scoring guide, and an `extracted` echo
+       of the caller's input.
 
     The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
     this tool — after calling it, score the candidate's resume against the job
-    and apply the scoring_guide's recommendation_rules in your reply.
+    (already pasted into this conversation) and apply the scoring_guide's
+    recommendation_rules in your reply.
 
     The resume injected here is the GENERAL resume (design D6), not the most
     recently tailored one: scoring a job against a resume already tailored
     FOR that job would inflate the match score by scoring the resume against
     itself.
 
-    This tool NEVER raises — all failures are encoded in the return envelope.
+    This tool NEVER raises for any documented failure mode — all such
+    failures are encoded in the return envelope. An unexpected keyword
+    argument (e.g. a JD text payload) is a caller programming error and
+    raises normally, exactly as calling any Python function with an unknown
+    keyword does.
 
     Args:
-        url: The raw job posting URL being analyzed. Resolved to a job_id
-             (exact match against the jobs table) so the general-resume
-             selection can exclude a resume already tailored to this job.
+        title:        Job title, Claude-extracted from the pasted posting.
+        company:      Company name, Claude-extracted.
+        country:      Free-text country, Claude-extracted. Used later (PR3b)
+                      for the work-authorization comparison.
+        url:          The job posting URL, if any. Resolved to a job_id
+                      (exact match against the jobs table) so the
+                      general-resume selection can exclude a resume already
+                      tailored to this job. None when the user has no URL to
+                      give (e.g. a referral).
+        custom_title: The user's handle for a URL-less job. Echoed back, AND
+                      — when `url` is absent — resolved to a job_id the same
+                      way `url` is, so Guard 1 (anti-self-scoring) stays
+                      armed for jobs saved without a url. If more than one
+                      saved job shares this custom_title, this tool refuses
+                      to guess and returns error="ambiguous_custom_title".
 
     Returns:
-        AnalyzeJobResult with resume and scoring_guide populated on success,
-        or error/message fields populated on failure.
+        AnalyzeJobResult with extracted/resume/scoring_guide populated on
+        success, or error/message fields populated on failure
+        ("no_resume" | "corrupt" | "ambiguous_custom_title").
     """
-    # --- Step 1: Resume precondition ---
+    # --- Step 1: Resolve job_id (Guard 1), then the resume precondition ---
     try:
-        job_id = _find_job_id_by_url(url)
+        if url is not None:
+            job_id = _find_job_id_by_url(url)
+        elif custom_title is not None:
+            matching_ids = _find_job_ids_by_custom_title(custom_title)
+            if len(matching_ids) > 1:
+                return AnalyzeJobResult(
+                    error="ambiguous_custom_title",
+                    message=(
+                        f"{len(matching_ids)} saved jobs share custom_title "
+                        f"{custom_title!r} (ids: {matching_ids}). Re-analyze "
+                        f"with 'url' instead, or use get_job with a specific "
+                        f"'id' to confirm which job this is before "
+                        f"proceeding."
+                    ),
+                )
+            job_id = matching_ids[0] if matching_ids else None
+        else:
+            job_id = None
         resume = _general_resume(job_id=job_id)
     except ValueError as exc:
         # NOT no_resume: the database exists and is unreadable or malformed.
@@ -155,6 +251,14 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
 
     # --- Step 2: Hand facts + rubric to Claude for scoring ---
     return AnalyzeJobResult(
+        extracted=ExtractedFields(
+            title=title,
+            company=company,
+            country=country,
+            url=url,
+            custom_title=custom_title,
+        ),
         resume=resume,
         scoring_guide=_scoring_guide(),
+        notice=_NO_URL_NOTICE if (url is None and custom_title is None) else None,
     )
