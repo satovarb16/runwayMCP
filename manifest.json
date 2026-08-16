@@ -66,6 +66,10 @@
     {
       "name": "set_application_status",
       "description": "Set a stored job's application status (not_applied, applied, interviewing, offer, rejected, withdrawn, ghosted). Any status can transition to any other."
+    },
+    {
+      "name": "set_work_authorization",
+      "description": "Declare the full list of countries you may legally work in (replaces any prior declaration). Required before analyze_job will run: it compares each job's country against this list live and warns on a mismatch, but never blocks or stores the result."
     }
   ],
   "compatibility": {

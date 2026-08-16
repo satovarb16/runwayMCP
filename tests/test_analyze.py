@@ -33,6 +33,12 @@ def _save_base_resume(label="Base", content="Jane Doe — Python engineer"):
     return save_resume_version(content=content, label=label, parent_id=None)
 
 
+def _declare_work_auth(countries=("USA",)):
+    from tools.work_auth import set_work_authorization
+
+    return set_work_authorization(countries=list(countries))
+
+
 # ---------------------------------------------------------------------------
 # 3a.2a: analyze_job is `def`, not `async def`
 # ---------------------------------------------------------------------------
@@ -51,6 +57,7 @@ class TestSyncNotAsync:
         self, db_path
     ):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="USA")
@@ -110,6 +117,14 @@ class TestPydanticModels:
         from tools.analyze import AnalyzeJobResult
 
         assert "extracted" in AnalyzeJobResult.model_fields
+
+    @pytest.mark.contract
+    def test_3b1n_analyze_job_result_has_work_authorization_field(self):
+        """3b.1n (completes 3a.2n): the field itself did not exist on
+        AnalyzeJobResult until PR3b."""
+        from tools.analyze import AnalyzeJobResult
+
+        assert "work_authorization" in AnalyzeJobResult.model_fields
 
     def test_analyze_job_result_no_match_or_recommendation_field(self):
         from tools.analyze import AnalyzeJobResult
@@ -175,6 +190,7 @@ class TestNoJdTextParameter:
 
     def test_sc33_call_with_title_company_country_succeeds(self, db_path):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="USA")
@@ -200,6 +216,7 @@ class TestNoJdTextParameter:
 class TestOutputContract:
     def test_sc35_extracted_echoes_input_fields_verbatim(self, db_path):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(
@@ -214,6 +231,7 @@ class TestOutputContract:
         """This documents the accepted risk from D2 as observable behavior,
         not merely narrative — no plausibility check on country/title/company."""
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="Nowhereland")
@@ -225,6 +243,7 @@ class TestOutputContract:
         self, db_path
     ):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="USA")
@@ -238,6 +257,7 @@ class TestOutputContract:
 
     def test_extracted_url_and_custom_title_default_to_none_when_omitted(self, db_path):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="USA")
@@ -252,6 +272,7 @@ class TestOutputContract:
             url="https://example.com/job/123", title="X", company="Y", country="Z"
         )
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(
@@ -274,6 +295,7 @@ class TestOutputContract:
 class TestNoPersistence:
     def test_sc39_analyzing_without_saving_leaves_no_trace(self, db_path):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
         from tools.jobs_store import list_jobs
 
@@ -293,10 +315,12 @@ class TestNoPersistence:
 class TestNotice:
     def test_notice_present_when_url_is_none(self, db_path):
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(title="SWE", company="Acme", country="USA")
 
+        assert result.error is None
         assert result.notice is not None
 
     def test_notice_absent_when_url_is_given(self, db_path):
@@ -306,6 +330,7 @@ class TestNotice:
             url="https://example.com/job/123", title="X", company="Y", country="Z"
         )
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(
@@ -315,6 +340,7 @@ class TestNotice:
             url="https://example.com/job/123",
         )
 
+        assert result.error is None
         assert result.notice is None
 
     def test_notice_absent_when_custom_title_is_given_even_without_url(self, db_path):
@@ -322,12 +348,14 @@ class TestNotice:
         user has already satisfied the notice's purpose — repeating it
         would send them through a redundant round-trip."""
         _save_base_resume()
+        _declare_work_auth()
         from tools.analyze import analyze_job
 
         result = analyze_job(
             title="SWE", company="Acme", country="USA", custom_title="Acme referral"
         )
 
+        assert result.error is None
         assert result.notice is None
 
 
@@ -414,6 +442,7 @@ class TestResumePrecondition:
             parent_id=base.id,
             job_id=job.id,
         )
+        _declare_work_auth()
 
         from tools.analyze import analyze_job
 
@@ -428,6 +457,116 @@ class TestResumePrecondition:
         assert result.resume is not None
         assert result.resume.id == base.id
         assert result.resume.id != tailored_child.id
+
+
+# ---------------------------------------------------------------------------
+# R12-R14/SC-24, SC-25, SC-28, SC-29, SC-31, SC-32 — the work-authorization
+# precondition wired into analyze_job's step order (task 3b.1m). Design D5/
+# D7: resume precondition first (unchanged), work-authorization second,
+# envelope-build third.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkAuthorizationPrecondition:
+    def test_sc24_no_work_authorization_declared_returns_error(self, db_path):
+        _save_base_resume()
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="Germany")
+
+        assert result.error == "no_work_authorization"
+        assert result.message is not None
+        assert "set_work_authorization" in result.message
+        assert result.resume is None
+        assert result.scoring_guide is None
+        assert result.work_authorization is None
+
+    def test_resume_precondition_wins_when_both_missing(self, db_path):
+        """Explicit ordering decision (task brief): a first-time user with
+        NEITHER a resume NOR a declared work authorization must get
+        "no_resume", not "no_work_authorization" — resume precondition is
+        checked first, unchanged from PR3a/design D5. Already implied by
+        test_sc38_empty_store_no_resume_error (which never declares work
+        authorization either); this test names the ordering decision
+        explicitly so it cannot be silently reversed."""
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="Germany")
+
+        assert result.error == "no_resume"
+
+    def test_sc25_analyze_job_succeeds_once_work_authorization_is_set(self, db_path):
+        _save_base_resume()
+        _declare_work_auth(["USA"])
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+
+        assert result.error is None
+        assert result.work_authorization is not None
+        assert result.work_authorization.status == "authorized"
+
+    def test_sc28_declared_country_produces_no_warning_in_envelope(self, db_path):
+        _save_base_resume()
+        _declare_work_auth(["USA"])
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+
+        assert result.error is None
+        assert result.work_authorization.warning is None
+
+    def test_sc29_undeclared_country_produces_warning_but_still_succeeds(self, db_path):
+        """SC-29: the warning is additive information, not a blocking
+        error — the call still succeeds."""
+        _save_base_resume()
+        _declare_work_auth(["USA"])
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="Germany")
+
+        assert result.error is None
+        assert result.resume is not None
+        assert result.scoring_guide is not None
+        assert result.work_authorization.status == "warned"
+        assert result.work_authorization.warning is not None
+
+    def test_sc31_warning_recomputes_live_never_cached(self, db_path):
+        """The comparison must recompute fresh against the CURRENT setting
+        on every call — nothing about it is a stored property of the job."""
+        _save_base_resume()
+        _declare_work_auth(["Germany"])
+        from tools.analyze import analyze_job
+
+        first = analyze_job(title="SWE", company="Acme", country="Germany")
+        assert first.work_authorization.status == "authorized"
+
+        _declare_work_auth(["USA"])
+        second = analyze_job(title="SWE", company="Acme", country="Germany")
+
+        assert second.work_authorization.status == "warned"
+
+    def test_sc32_corrupt_work_auth_store_reported_as_corrupt_not_unset(
+        self, db_path, monkeypatch
+    ):
+        """Guard-2-style distinction extended to the new precondition: a
+        broken work_authorizations read must not be reported as
+        no_work_authorization, which would send the user to
+        set_work_authorization only to have it fail identically."""
+        _save_base_resume()
+        import tools.analyze as analyze_mod
+
+        def _boom():
+            raise ValueError("work_authorizations store is corrupt")
+
+        monkeypatch.setattr(analyze_mod, "_declared_authorizations", _boom)
+
+        from tools.analyze import analyze_job
+
+        result = analyze_job(title="SWE", company="Acme", country="USA")
+
+        assert result.error == "corrupt"
+        assert result.error != "no_work_authorization"
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +624,7 @@ class TestGuard1AntiSelfScoring:
             parent_id=base.id,
             job_id=other_job.id,
         )
+        _declare_work_auth()
 
         from tools.analyze import analyze_job
 
@@ -513,6 +653,7 @@ class TestGuard1AntiSelfScoring:
             parent_id=base.id,
             job_id=other_job.id,
         )
+        _declare_work_auth()
 
         from tools.analyze import analyze_job
 
