@@ -71,3 +71,15 @@ def test_manifest_tools_match_registered_tools():
     }
     assert not (stale & registered_names)
     assert not (stale & manifest_names)
+
+
+@pytest.mark.integration
+def test_manifest_list_jobs_description_mentions_company_filter():
+    """Finding 6: list_jobs gained a `company` filter (D9, PR3a) but its
+    manifest.json description still only enumerated status/score/date — the
+    set-equality test above only checks tool NAMES, so nothing else catches
+    a stale description."""
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    entries = {tool["name"]: tool for tool in manifest["tools"]}
+
+    assert "company" in entries["list_jobs"]["description"]

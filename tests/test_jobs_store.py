@@ -497,6 +497,105 @@ def test_list_jobs_never_returns_jd_text_field(db_path):
 
 
 # ---------------------------------------------------------------------------
+# D9 (task 3a.1h/3a.1i): list_jobs gains a `company` filter — substring,
+# COLLATE NOCASE. SC-1 is the release's headline query ("did I apply to
+# Acme?") and is unanswerable without this filter except by listing the
+# whole store.
+# ---------------------------------------------------------------------------
+
+
+def test_list_jobs_company_filter_substring_match(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+    save_job_analysis(
+        url="https://b.com/1", title="B", company="Beta Inc", country="US"
+    )
+
+    result = list_jobs(company="Acme")
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].company == "Acme Corp"
+
+
+def test_list_jobs_company_filter_is_case_insensitive(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="acme")
+
+    assert result.success is True
+    assert result.count == 1
+
+
+def test_list_jobs_company_filter_no_match_returns_empty(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="Nonexistent")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_list_jobs_company_filter_combines_with_status_filter(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status, list_jobs
+
+    j1 = save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+    save_job_analysis(
+        url="https://a.com/2", title="B", company="Acme Corp", country="US"
+    )
+    set_application_status(id=j1.id, status="applied")
+
+    result = list_jobs(company="Acme", status="applied")
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].id == j1.id
+
+
+def test_list_jobs_company_filter_escapes_percent_wildcard(db_path):
+    """Finding 3: '%' in the user's string must be a literal, not a SQL
+    LIKE wildcard — otherwise company='%' would match every row while the
+    caller believes they asked for a filtered result."""
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="%")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_list_jobs_company_filter_escapes_underscore_wildcard(db_path):
+    """Finding 3: '_' in the user's string must be a literal, not a SQL
+    LIKE single-character wildcard — otherwise company='A_B' would match
+    'AxB'."""
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(url="https://a.com/1", title="A", company="AxB", country="US")
+
+    result = list_jobs(company="A_B")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+# ---------------------------------------------------------------------------
 # set_application_status — now accepts id OR url
 # ---------------------------------------------------------------------------
 
@@ -712,3 +811,313 @@ def test_sc22_partial_cross_conversation_recall_without_get_job(db_path):
 
     fetched = get_resume_version(id=version.id)
     assert fetched.version.content == "Datadog-tailored resume text"
+
+
+# ---------------------------------------------------------------------------
+# get_job (D6, tasks 3a.1a-3a.1g/3a.1j/3a.1k) — REQUIRED new tool. Without
+# it jd_text is write-only, reachable through no read path.
+# ---------------------------------------------------------------------------
+
+
+def test_sc11_jd_text_stored_and_retrievable_via_get_job(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        jd_text="Full pasted description...\nwith newlines",
+    )
+
+    result = get_job(id=saved.id, include_description=True)
+
+    assert result.success is True
+    assert result.job.id == saved.id
+    assert result.description == "Full pasted description...\nwith newlines"
+    assert result.has_description is True
+
+
+def test_sc12_get_job_unknown_id_returns_not_found(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job(id="ghost")
+
+    assert result.success is False
+    assert result.error == "not_found"
+
+
+def test_sc13_get_job_on_corrupt_store_returns_corrupt_not_not_found(db_path):
+    """A naive implementation that catches broadly and reports "not_found"
+    would wrongly suggest the id is simply wrong, when the whole store is
+    broken."""
+    from tools.jobs_store import get_job
+
+    db_path.write_bytes(b"not a database")
+
+    result = get_job(id="J1")
+
+    assert result.success is False
+    assert result.error == "corrupt"
+
+
+def test_sc14_jd_text_omitted_on_save_leaves_get_job_description_none(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(id=saved.id, include_description=True)
+
+    assert result.success is True
+    assert result.description is None
+    assert result.has_description is False
+
+
+def test_sc16_get_job_is_the_only_path_that_returns_jd_text(db_path):
+    """SC-15/SC-16 pairing: list_jobs excludes it (proven elsewhere), get_job
+    is the sole read path — and only when include_description=True."""
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        jd_text="a" * 5000,
+    )
+
+    default_call = get_job(id=saved.id)
+    assert default_call.description is None  # include_description defaults False
+    assert default_call.has_description is True  # but the affordance is visible
+
+    explicit_call = get_job(id=saved.id, include_description=True)
+    assert explicit_call.description == "a" * 5000
+
+
+def test_get_job_by_url(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(url="https://ex.com/1")
+
+    assert result.success is True
+    assert result.job.id == saved.id
+
+
+def test_get_job_neither_id_nor_url_is_invalid_input(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job()
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_both_id_and_url_is_invalid_input(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(id=saved.id, url="https://ex.com/1")
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_returns_linked_resume_version_summaries(db_path):
+    """D6: the linked resume summaries ARE the headline query — 'did I apply
+    to X?' -> 'yes, and with this resume.' Summaries, not content."""
+    from tools.jobs_store import save_job_analysis, get_job
+    from tools.resumes import save_resume_version
+
+    job = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+    version = save_resume_version(
+        content="tailored text",
+        label="Tailored for Acme",
+        parent_id=None,
+        job_id=job.id,
+    )
+
+    result = get_job(id=job.id)
+
+    assert result.success is True
+    assert len(result.resume_versions) == 1
+    assert result.resume_versions[0].id == version.id
+    assert result.resume_versions[0].label == "Tailored for Acme"
+    # summary, not the full text
+    assert not hasattr(result.resume_versions[0], "content")
+
+
+def test_sc22_full_cross_conversation_recall_via_get_job(db_path):
+    """SC-22: completes the round-trip from the PR2 partial test — this time
+    through get_job rather than list_resume_versions alone."""
+    from tools.jobs_store import save_job_analysis, set_application_status, get_job
+    from tools.resumes import save_resume_version, get_resume_version
+
+    job = save_job_analysis(
+        url="https://example.com/datadog", title="SWE", company="Datadog", country="US"
+    )
+    set_application_status(id=job.id, status="interviewing")
+    version = save_resume_version(
+        content="Datadog-tailored resume text",
+        label="Datadog — infra focus",
+        parent_id=None,
+        job_id=job.id,
+    )
+
+    found = get_job(id=job.id)
+
+    assert found.success is True
+    assert found.job.status == "interviewing"
+    assert len(found.resume_versions) == 1
+    assert found.resume_versions[0].id == version.id
+    assert found.resume_versions[0].label == "Datadog — infra focus"
+
+    fetched = get_resume_version(id=version.id)
+    assert fetched.version.content == "Datadog-tailored resume text"
+
+
+@pytest.mark.contract
+def test_get_job_result_has_no_visa_field_and_has_description_always_present():
+    from tools.jobs_store import GetJobResult
+
+    result = GetJobResult(success=True)
+    assert "has_description" in GetJobResult.model_fields
+    assert result.has_description is False  # always-present, defaults False
+    assert "visa" not in GetJobResult.model_fields
+
+
+# ---------------------------------------------------------------------------
+# get_job's custom_title lookup (findings 1/2) — a job saved without a url
+# is findable ONLY by custom_title; without this, that promise had no
+# retrieval path.
+# ---------------------------------------------------------------------------
+
+
+def test_get_job_by_custom_title_single_match(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        custom_title="Acme referral", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(custom_title="Acme referral")
+
+    assert result.success is True
+    assert result.job.id == saved.id
+
+
+def test_get_job_by_custom_title_no_match_is_not_found(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job(custom_title="Nonexistent")
+
+    assert result.success is False
+    assert result.error == "not_found"
+
+
+def test_get_job_by_custom_title_ambiguous_when_multiple_jobs_share_it(db_path):
+    """custom_title is NOT unique (R3/SC-08) — a lookup matching more than
+    one job must say so explicitly, not silently return the first."""
+    from tools.jobs_store import save_job_analysis, get_job
+
+    j1 = save_job_analysis(
+        custom_title="Acme referral", title="SWE 1", company="Acme", country="USA"
+    )
+    j2 = save_job_analysis(
+        custom_title="Acme referral", title="SWE 2", company="Acme", country="USA"
+    )
+
+    result = get_job(custom_title="Acme referral")
+
+    assert result.success is False
+    assert result.error == "ambiguous"
+    assert j1.id in result.message
+    assert j2.id in result.message
+
+
+def test_get_job_neither_id_url_nor_custom_title_is_invalid_input(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job()
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_id_and_custom_title_together_is_invalid_input(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        custom_title="Acme referral", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(id=saved.id, custom_title="Acme referral")
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: get_job's linked-resume-summaries query must not be `SELECT *`
+# — that would pull every version's full `content` even on the default
+# include_description=False path, to build a summary that discards it.
+# ---------------------------------------------------------------------------
+
+
+def test_get_job_resume_summaries_query_is_column_scoped_not_select_star(
+    db_path, monkeypatch
+):
+    """sqlite3.Connection is a C-extension type and cannot be monkeypatched
+    directly (its methods are read-only), so this spies via a thin proxy
+    wrapped around the real connection `get_job` actually uses."""
+    from contextlib import contextmanager
+
+    import tools.jobs_store as jobs_store_mod
+    from tools.jobs_store import save_job_analysis, get_job
+    from tools.resumes import save_resume_version
+
+    job = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+    save_resume_version(
+        content="x" * 10_000, label="Tailored", parent_id=None, job_id=job.id
+    )
+
+    executed_sql: list[str] = []
+
+    class _SpyConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            executed_sql.append(sql)
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    original_connect = jobs_store_mod.connect
+
+    @contextmanager
+    def _spy_connect(*args, **kwargs):
+        with original_connect(*args, **kwargs) as conn:
+            yield _SpyConn(conn)
+
+    monkeypatch.setattr(jobs_store_mod, "connect", _spy_connect)
+
+    get_job(id=job.id)
+
+    resume_query = next(
+        sql for sql in executed_sql if "resume_versions" in sql and "job_id = ?" in sql
+    )
+    assert "SELECT *" not in resume_query
