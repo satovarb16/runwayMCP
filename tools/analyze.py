@@ -10,15 +10,29 @@ general resume and the scoring rubric. The final contract (Claude-extracted
 not `async def`) lands in PR3a once the SQLite-backed stores and the pasted-JD
 input contract are in place.
 
+PR2 (SQLite) guard-preservation edit, tasks 2.5l/2.5o: Step 1 is still
+PR1-shaped (raw `url: str` in) but now resolves that `url` to a `job_id` via
+an exact lookup against the SQLite `jobs` table before calling the rewritten,
+job_id-keyed `_general_resume`. `job_id=None` is passed ONLY when no job row
+matches the url — the same answer a full job lookup would give for a job
+that was never saved, not a blanket bypass of the anti-self-scoring guard
+(Guard 1, SC-21). The `no_resume`/`corrupt` distinction (Guard 2) is
+preserved by wrapping both the url->job_id resolution and the
+_general_resume call in a single try/except ValueError block: a corrupt or
+unreadable database raises from either call and is reported as "corrupt";
+"no_resume" is reported only when the database is readable but nothing
+usable was found.
+
 Adds zero new external dependencies — the resume lookup is delegated to
-tools/resumes.py.
+tools/resumes.py and tools/jobs_store.py.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-from tools.resumes import _read_resumes, _general_resume, ResumeVersion
+from tools.jobs_store import _find_job_id_by_url
+from tools.resumes import _general_resume, ResumeVersion
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +57,10 @@ _SCORING_INSTRUCTIONS: str = (
     "APPLY, CONSIDER, or SKIP by applying the recommendation_rules in order. "
     "Be factual and objective — do not inflate the score. If you recommend "
     "APPLY or CONSIDER, tailor the resume text for this job and save it with "
-    "save_resume_version (parent_id=this resume's id, job_url=this job's "
-    "url)."
+    "save_resume_version (parent_id=this resume's id, job_id=the id returned "
+    "by save_job_analysis). save_job_analysis must be called FIRST so the "
+    "job row exists — save_resume_version's job_id is a foreign key and "
+    "rejects an id that does not yet exist."
 )
 
 
@@ -114,9 +130,9 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
     This tool NEVER raises — all failures are encoded in the return envelope.
 
     Args:
-        url: The raw job posting URL being analyzed. Used only to exclude a
-             resume already tailored to this job from the general-resume
-             selection.
+        url: The raw job posting URL being analyzed. Resolved to a job_id
+             (exact match against the jobs table) so the general-resume
+             selection can exclude a resume already tailored to this job.
 
     Returns:
         AnalyzeJobResult with resume and scoring_guide populated on success,
@@ -124,10 +140,10 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
     """
     # --- Step 1: Resume precondition ---
     try:
-        store = _read_resumes()
-        resume = _general_resume(store, for_job_url=url)
+        job_id = _find_job_id_by_url(url)
+        resume = _general_resume(job_id=job_id)
     except ValueError as exc:
-        # NOT no_resume: the store exists and is unreadable or malformed.
+        # NOT no_resume: the database exists and is unreadable or malformed.
         # Telling the user to run save_resume_version here sends them to a
         # tool that will fail the same way, on the same file.
         return AnalyzeJobResult(error="corrupt", message=str(exc))
