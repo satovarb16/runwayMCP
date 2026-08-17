@@ -5,60 +5,28 @@ recommendation. These tools PERSIST and RETRIEVE that structured data — they
 never call back to the model. This keeps the server free of MCP sampling and
 matches the project's philosophy: tools shape data, Claude reasons.
 
-Job records are stored at ~/.config/runway-mcp/jobs.json.
+SQLite-backed (design D1/D3/D8/D9/D10). `jobs.id` is a server-generated
+surrogate key — `url` is a nullable, unique ATTRIBUTE, not the identity, so
+supplying a URL later never orphans a resume version pointed at the job
+(D1's deciding argument). SQL owns structural invariants (url uniqueness via
+UNIQUE, referential integrity is resume_versions' concern); pydantic and this
+module own value-domain invariants (the 7-value status enum, "at least one
+handle" on create) — see design D8, no invariant is expressed in both places.
 
-Every mutating tool here does a whole-file read-modify-write. atomic_write_json
-guarantees the file is never left corrupt, but not that no write is lost: two
-tool calls dispatched close together can read the same snapshot, and the later
-write wins. Acceptable for a single-user local server; if this ever serves
-concurrent callers, the read-modify-write needs a file lock.
+get_job and list_jobs's `company` filter are PR3a's, not this module's.
 """
 
 from __future__ import annotations
 
-import json
-import shutil
-import sys
+import sqlite3
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from tools import _storage
-from tools._storage import store_lock
-
-# ---------------------------------------------------------------------------
-# ISO-8601 parsing helper
-# ---------------------------------------------------------------------------
-
-
-def _parse_iso(value: str) -> datetime:
-    """Parse an ISO-8601 datetime string to a timezone-aware datetime.
-
-    Handles both 'Z' and '+00:00' suffixes so that lexicographic format
-    differences do not cause incorrect timestamp comparisons.
-
-    Args:
-        value: ISO-8601 string (e.g. '2025-06-01T12:00:00Z' or
-               '2025-06-01T12:00:00+00:00').
-
-    Returns:
-        An aware datetime object.
-
-    Raises:
-        ValueError: if the string cannot be parsed as ISO-8601.
-    """
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-# ---------------------------------------------------------------------------
-# Module-level constants
-# ---------------------------------------------------------------------------
-
-_JOBS_PATH: Path = Path.home() / ".config" / "runway-mcp" / "jobs.json"
-
-_SCHEMA_VERSION: int = 2  # v1 == implicit legacy schema (`applied: bool`, no key)
+from tools._db import connect, _normalize_timestamp
+from tools.resumes import ResumeVersionSummary
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -78,42 +46,43 @@ class ApplicationStatus(str, Enum):
 
 
 class StoredJob(BaseModel):
-    """A single analyzed job record persisted to the jobs store."""
+    """A single analyzed job record persisted to the jobs table.
 
-    # Unknown fields are an error, not something to drop quietly. Pydantic
-    # ignores them by default, which during the applied->status rename let a
-    # stale kwarg pass silently and surface later as a baffling wrong-value
-    # assertion instead of an immediate failure.
+    No `jd_text` field here by construction — it lives in the 1:1
+    `job_descriptions` side table (D1), so `SELECT * FROM jobs` (and this
+    model) structurally cannot leak it into a list result.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    url: str  # dedup / upsert key
+    id: str  # uuid4().hex, server-generated — the identity, never url/custom_title
+    url: str | None = None
+    custom_title: str | None = None
     title: str
     company: str
-    visa_verdict: str  # GREEN | YELLOW | RED | UNKNOWN
+    country: str | None = None  # Claude-extracted free text; NULL for migrated rows
     analyzed_at: str  # ISO-8601, server-stamped by save_job_analysis
     status: ApplicationStatus = ApplicationStatus.NOT_APPLIED
-    score: int | None = None  # 0-100, Claude-supplied (never computed server-side)
-    recommendation: str | None = None  # APPLY | CONSIDER | SKIP | None, Claude-supplied
+    score: int | None = None
+    recommendation: str | None = None
     notes: str | None = None
-
-
-class JobStore(BaseModel):
-    """Top-level container for the jobs.json file."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: int = _SCHEMA_VERSION
-    jobs: list[StoredJob] = []
 
 
 class SaveJobResult(BaseModel):
     """Return value for save_job_analysis."""
 
     success: bool
+    id: str | None = None
     url: str | None = None
+    custom_title: str | None = None
     updated: bool | None = None  # True=upserted existing record, False=new record
+    possible_duplicate_id: str | None = None  # advisory only, never blocks (D10)
     storage_path: str | None = None
-    error_message: str | None = None
+    error: str | None = (
+        # "invalid_input" | "not_found" | "duplicate_url" | "corrupt" | "write_error"
+        None
+    )
+    message: str | None = None
 
 
 class ListJobsResult(BaseModel):
@@ -125,187 +94,117 @@ class ListJobsResult(BaseModel):
     error_message: str | None = None
 
 
+class GetJobResult(BaseModel):
+    """Return value for get_job (D6)."""
+
+    success: bool
+    job: StoredJob | None = None
+    description: str | None = None
+    has_description: bool = False  # ALWAYS present — the affordance that
+    # makes the jd_text opt-in discoverable without dragging it into
+    # context by default (include_description=False is the default).
+    resume_versions: list[ResumeVersionSummary] = []
+    # "not_found" | "invalid_input" | "corrupt" | "ambiguous" (custom_title
+    # matched more than one job — see get_job's docstring)
+    error: str | None = None
+    message: str | None = None
+
+
 class SetStatusResult(BaseModel):
     """Return value for set_application_status."""
 
     success: bool
+    id: str | None = None
     url: str | None = None
     status: str | None = None
     previous_status: str | None = None
     error: str | None = (
-        None  # "not_found" | "corrupt" | "invalid_status" | "write_error"
+        None  # "not_found" | "corrupt" | "invalid_status" | "invalid_input" | "write_error"
     )
     message: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Persistence helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-class SchemaTooNewError(ValueError):
-    """The store was written by a newer runway-mcp than this one understands.
+def _row_to_stored_job(row: sqlite3.Row) -> StoredJob:
+    return StoredJob.model_validate(dict(row))
 
-    A ValueError subclass so every existing `except ValueError` at the tool
-    boundary still turns it into an error envelope, but a distinct type so
-    _read_jobs can let it through without the "corrupt" wrapper. The file is
-    not corrupt — it is fine, and telling the user otherwise is what makes
-    them delete it.
+
+def _find_job_by_id(conn: sqlite3.Connection, id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM jobs WHERE id = ?", (id,)).fetchone()
+
+
+def _find_job_by_url(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQLite LIKE metacharacters so a caller's literal string is
+    matched literally, only the surrounding `%%` wildcards added by the
+    caller are wildcards.
+
+    Without this, `list_jobs(company="A_B")` would match "AxB" (`_` matches
+    any single character) and `list_jobs(company="%")` would match every
+    row while still reporting a filtered result — both silent, both wrong.
+    The escape character `\\` must itself be escaped first, or a caller's
+    literal backslash would be misread as escaping the character after it.
     """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _coerce_legacy(raw: dict) -> tuple[dict, bool]:
-    """Coerce a pre-migration jobs payload to the current schema, in memory only.
+def _find_job_id_by_url(url: str) -> str | None:
+    """Resolve a job url to its surrogate id via an exact match (url is UNIQUE).
 
-    For every job record that does not already carry a ``status`` key, the
-    legacy ``applied: bool`` field is renamed: ``True`` -> ``"applied"``,
-    ``False``/missing -> ``"not_applied"`` (SC-25, SC-26). The payload is then
-    stamped with ``schema_version = 2``. A payload already carrying
-    ``schema_version == 2`` whose records all have ``status`` is returned
-    unchanged (SC-27).
-
-    The per-record ``status`` check — not the top-level version stamp — is what
-    decides whether coercion runs. A file stamped version 2 that still holds a
-    legacy record (hand-edited, or written by external tooling) would otherwise
-    have its ``applied`` value silently dropped by pydantic as an unknown field
-    and default to ``not_applied``. The per-record guard is idempotent and
-    cheap, so it costs nothing to always run it.
+    Used by analyze.py's Step 1 (Guard 1 resolution, PR2 task 2.5l): the
+    incoming raw `url` is resolved to a `job_id` before calling the
+    job_id-keyed `_general_resume`, so the anti-self-scoring guard survives
+    the SQLite rewrite even though `analyze_job`'s signature is still
+    PR1-shaped (raw url in, not the D5 extracted-fields contract).
 
     Args:
-        raw: The parsed JSON payload (dict) read from the jobs store file.
+        url: The raw job posting URL.
 
     Returns:
-        A tuple of ``(coerced_payload, was_legacy)`` where ``was_legacy`` is
-        True when the payload was not already at the current schema (used to
-        trigger a one-time backup before any legacy read).
+        The matching job's id, or None if no job has this url — this is the
+        ONLY case where None is returned; it is never a blanket bypass.
 
     Raises:
-        ValueError: if ``jobs`` is not a list, or any record is not an object.
-                    Raised rather than skipped so a malformed store surfaces as
-                    corrupt instead of silently losing records.
+        ValueError: on a corrupt or unreadable database (propagates so the
+                    caller can distinguish "corrupt" from "no match").
     """
-    found_version = raw.get("schema_version")
-    if isinstance(found_version, int) and found_version > _SCHEMA_VERSION:
-        # Refuse rather than downgrade. Treating every mismatch as "legacy"
-        # re-stamped a newer store as the current version and let pydantic
-        # drop the fields it does not know about, so the next write persisted
-        # the lossy copy.
-        raise SchemaTooNewError(
-            f"Jobs store was written by a newer version of runway-mcp "
-            f"(schema_version {found_version} > {_SCHEMA_VERSION}). The file is "
-            f"fine: upgrade runway-mcp rather than letting it rewrite the file."
-        )
-
-    jobs = raw.get("jobs", [])
-    if not isinstance(jobs, list):
-        raise ValueError(f"expected 'jobs' to be a list, got {type(jobs).__name__}")
-
-    coerced_jobs = []
-    did_coerce = False
-    for job in jobs:
-        if not isinstance(job, dict):
-            raise ValueError(
-                f"expected each job record to be an object, got {type(job).__name__}"
-            )
-        job = dict(job)
-        if "status" not in job:
-            applied = job.pop("applied", False)
-            job["status"] = "applied" if applied else "not_applied"
-            did_coerce = True
-        coerced_jobs.append(job)
-
-    was_legacy = did_coerce or raw.get("schema_version") != _SCHEMA_VERSION
-    if not was_legacy:
-        return raw, False
-
-    coerced = dict(raw)
-    coerced["jobs"] = coerced_jobs
-    coerced["schema_version"] = _SCHEMA_VERSION
-    return coerced, True
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM jobs WHERE url = ?", (url,)).fetchone()
+    return row["id"] if row is not None else None
 
 
-def _backup_once(path: Path) -> None:
-    """Write a one-time ``.bak`` copy of a legacy jobs store before coercion.
+def _find_job_ids_by_custom_title(custom_title: str) -> list[str]:
+    """Resolve a custom_title to every job id sharing it, exact match.
 
-    Best-effort: any OSError while copying is swallowed with a stderr warning
-    so a failed backup never blocks the read path. Skips silently if the
-    backup already exists (forward-only after the first legacy read).
+    `custom_title` is NOT unique — `save_job_analysis` deliberately never
+    matches an existing record by `custom_title` (R3/SC-08), so re-saving
+    under the same title creates a second row. Callers that need a single
+    job (analyze.py's Guard 1 resolution, get_job's custom_title lookup)
+    MUST look at the length of the returned list and decide explicitly what
+    to do with 0, 1, or >1 matches — silently taking the first would hide a
+    genuine ambiguity from the caller.
 
     Args:
-        path: Path to the jobs store file being backed up.
-    """
-    backup_path = path.with_name(path.name + ".bak")
-    if backup_path.exists():
-        return
-    try:
-        shutil.copyfile(path, backup_path)
-    except OSError as exc:
-        print(f"Warning: failed to write jobs store backup: {exc}", file=sys.stderr)
-
-
-def _read_jobs(path: Path | None = None) -> JobStore:
-    """Read and parse the stored jobs JSON.
-
-    Pre-validation-coerces legacy (pre-migration) records via
-    `_coerce_legacy` before handing the payload to pydantic, so old
-    `applied: bool` records load cleanly as `status` (SC-25..SC-27). When a
-    legacy payload is detected, a one-time `.bak` backup is written first
-    (best-effort, see `_backup_once`) before coercion is applied in memory.
-
-    Args:
-        path: Path to the jobs JSON file. If None, uses the module-level
-              _JOBS_PATH (resolved at call time so tests can monkeypatch it).
+        custom_title: The exact custom_title to look up.
 
     Returns:
-        JobStore parsed from the file, or an empty JobStore when the file does
-        not exist (first-run / normal state — missing is NOT an error).
+        A list of matching job ids — possibly empty, possibly more than one.
 
     Raises:
-        ValueError: if the file exists but its content is malformed JSON or
-                    fails pydantic validation (even after coercion), or if it
-                    cannot be read at all (permissions, path is a directory).
-                    OSError is wrapped rather than propagated so every caller's
-                    existing `except ValueError` keeps the tool boundary
-                    exception-free. The file is never auto-repaired.
+        ValueError: on a corrupt or unreadable database.
     """
-    resolved = path if path is not None else _JOBS_PATH
-    if not resolved.exists():
-        return JobStore(jobs=[])
-    try:
-        raw = json.loads(resolved.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError(
-                f"expected a JSON object at the top level, got {type(raw).__name__}"
-            )
-        coerced, was_legacy = _coerce_legacy(raw)
-        if was_legacy:
-            _backup_once(resolved)
-        return JobStore.model_validate(coerced)
-    except SchemaTooNewError:
-        # Already accurate and actionable — do not relabel it as corruption.
-        raise
-    except OSError as exc:
-        # Unreadable is not the same as corrupt — the file may be perfectly
-        # valid. Wrapped as ValueError so callers need only one except clause
-        # and no OSError ever reaches the MCP boundary as a raw traceback.
-        raise ValueError(f"Jobs store is unreadable: {exc}") from exc
-    except (ValidationError, ValueError) as exc:
-        raise ValueError(f"Jobs store is corrupt: {exc}") from exc
-
-
-def _write_jobs(store: JobStore, path: Path | None = None) -> None:
-    """Atomically write the jobs store as pretty-printed JSON.
-
-    Delegates to tools._storage.atomic_write_json (temp-file + rename
-    pattern) to avoid corrupting an existing store on partial write.
-
-    Args:
-        store: The JobStore to persist.
-        path:  Destination path. If None, uses _JOBS_PATH (resolved at call
-               time so tests can monkeypatch it).
-    """
-    resolved = path if path is not None else _JOBS_PATH
-    _storage.atomic_write_json(store, resolved, tmp_prefix=".jobs_tmp_")
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE custom_title = ?", (custom_title,)
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -314,123 +213,251 @@ def _write_jobs(store: JobStore, path: Path | None = None) -> None:
 
 
 def save_job_analysis(
-    url: str,
     title: str,
     company: str,
-    visa_verdict: str,
+    country: str,
+    id: str | None = None,
+    url: str | None = None,
+    custom_title: str | None = None,
+    jd_text: str | None = None,
     score: int | None = None,
     recommendation: str | None = None,
     notes: str | None = None,
 ) -> SaveJobResult:
-    """Persist an analyzed job record to the jobs store.
+    """Persist an analyzed job record. Upserts by `id` then by `url` (D10).
 
-    The server stamps ``analyzed_at`` with the current UTC time. Upserts by
-    ``url`` — if a record with the same URL already exists it is replaced in
-    full (latest save wins). This tool NEVER raises — all failures are encoded
-    in the return envelope.
+    Resolution order:
+    1. `id` given -> that row is the target; unknown id -> error="not_found".
+    2. No `id`, `url` given and matching an existing row -> that row is the
+       target (upsert by URL, unchanged semantics from the prior JSON store,
+       including "omitted optional argument preserves the previous value").
+    3. Otherwise -> a brand new row. `title`/`company` are NEVER used to
+       match an existing record (R3) — a user editing a title for clarity
+       must not silently create a duplicate under an update path, and title
+       text is never treated as an update key either way.
+
+    `url` and `custom_title` follow the same "explicit argument overwrites,
+    omission (None) preserves the previous value" rule as `score`/
+    `recommendation`/`notes`/`jd_text` — this is what lets a URL be supplied
+    later without disturbing the custom_title, and vice versa (SC-04). On a
+    brand new row, at least one of `url`/`custom_title` must resolve to a
+    non-None value, or the record has no way for a human to find it again
+    (R1, SC-03).
+
+    This tool NEVER raises — all failures are encoded in the return envelope.
 
     Args:
-        url:            The job posting URL (used as the dedup / upsert key).
-        title:          Job title extracted from the posting.
-        company:        Company name extracted from the posting.
-        visa_verdict:   H-1B visa verdict for this company (GREEN/YELLOW/RED/UNKNOWN).
-        score:          0-100 match score produced by Claude (None if not scored yet).
-        recommendation: APPLY/CONSIDER/SKIP produced by Claude (None if not yet scored).
-        notes:          Optional free-text notes from the user.
+        title:           Job title (Claude-extracted). Always required, always
+                          overwrites — no omit-preserve semantics.
+        company:         Company name (Claude-extracted). Same as title.
+        country:         Free-text country (Claude-extracted). Same as title.
+        id:              Existing job id to update. None to create or
+                          upsert-by-url.
+        url:              Job posting URL. Nullable/unique attribute, not the
+                          identity (D1). Omitted (None) preserves the
+                          existing value on an update.
+        custom_title:     User-supplied handle when url is absent. Same
+                          omit-preserve rule as url.
+        jd_text:          Full pasted job description, stored in the
+                          `job_descriptions` side table. Omitted (None)
+                          leaves any existing captured JD untouched.
+        score:            0-100 match score (Claude-supplied). Omit-preserve.
+        recommendation:   APPLY/CONSIDER/SKIP (Claude-supplied). Omit-preserve.
+        notes:            Free-text notes. Omit-preserve.
 
     Returns:
-        SaveJobResult with success=True, url, updated flag, and storage_path on
-        success; success=False with error_message on failure.
+        SaveJobResult with success=True, id, url, custom_title, updated flag
+        on success; success=False with error/message on failure.
     """
-
-    with store_lock(_JOBS_PATH):
-        try:
-            store = _read_jobs()
-        except ValueError as exc:
-            return SaveJobResult(success=False, error_message=str(exc))
-
-        # Detect upsert
-        existing_index = next(
-            (i for i, j in enumerate(store.jobs) if j.url == url), None
-        )
-        updated = existing_index is not None
-
-        try:
-            # FIX 3: preserve `status` on upsert; default NOT_APPLIED for new records
-            existing_status = (
-                store.jobs[existing_index].status
-                if updated
-                else ApplicationStatus.NOT_APPLIED
-            )
-            # One rule for every optional field: an omitted argument means "leave
-            # it alone". Applying it to some fields and not others is what made a
-            # bare re-save of a reposted listing keep the user's notes while
-            # destroying the score and recommendation — and drop the job out of
-            # every min_score query. An explicit argument still overwrites.
-            previous = store.jobs[existing_index] if updated else None
-            existing_notes = previous.notes if previous else None
-            existing_score = previous.score if previous else None
-            existing_recommendation = previous.recommendation if previous else None
-
-            # Build the new record (server stamps analyzed_at)
-            # FIX 2: StoredJob construction is inside the try so ValidationError is caught
-            new_record = StoredJob(
-                url=url,
-                title=title,
-                company=company,
-                visa_verdict=visa_verdict,
-                analyzed_at=datetime.now(timezone.utc).isoformat(),
-                status=existing_status,
-                score=score if score is not None else existing_score,
-                recommendation=(
-                    recommendation
-                    if recommendation is not None
-                    else existing_recommendation
-                ),
-                notes=notes if notes is not None else existing_notes,
-            )
-
-            if updated:
-                store.jobs[existing_index] = new_record
+    try:
+        with connect(write=True) as conn:
+            if id is not None:
+                existing = _find_job_by_id(conn, id)
+                if existing is None:
+                    return SaveJobResult(
+                        success=False,
+                        error="not_found",
+                        message=f"No job exists with id {id!r}.",
+                    )
+                target_id = id
+                updated = True
+            elif url is not None:
+                existing = _find_job_by_url(conn, url)
+                target_id = existing["id"] if existing else uuid.uuid4().hex
+                updated = existing is not None
             else:
-                store.jobs.append(new_record)
+                existing = None
+                target_id = uuid.uuid4().hex
+                updated = False
 
-            _write_jobs(store)
-        except (ValueError, ValidationError) as exc:
-            return SaveJobResult(success=False, error_message=str(exc))
+            final_url = (
+                url if url is not None else (existing["url"] if existing else None)
+            )
+            final_custom_title = (
+                custom_title
+                if custom_title is not None
+                else (existing["custom_title"] if existing else None)
+            )
 
-        return SaveJobResult(
-            success=True,
-            url=url,
-            updated=updated,
-            storage_path=str(_JOBS_PATH.resolve()),
-        )
+            if not updated and final_url is None and final_custom_title is None:
+                return SaveJobResult(
+                    success=False,
+                    error="invalid_input",
+                    message=(
+                        "At least one of 'url' or 'custom_title' is required "
+                        "so this job can be found again later."
+                    ),
+                )
+
+            final_score = (
+                score
+                if score is not None
+                else (existing["score"] if existing else None)
+            )
+            final_recommendation = (
+                recommendation
+                if recommendation is not None
+                else (existing["recommendation"] if existing else None)
+            )
+            final_notes = (
+                notes
+                if notes is not None
+                else (existing["notes"] if existing else None)
+            )
+            final_status = (
+                existing["status"] if existing else ApplicationStatus.NOT_APPLIED.value
+            )
+            analyzed_at = datetime.now(timezone.utc).isoformat()
+
+            # Validate types via pydantic BEFORE touching SQL, so a bad
+            # score type is reported as invalid_input, never write_error.
+            try:
+                StoredJob(
+                    id=target_id,
+                    url=final_url,
+                    custom_title=final_custom_title,
+                    title=title,
+                    company=company,
+                    country=country,
+                    analyzed_at=analyzed_at,
+                    status=final_status,
+                    score=final_score,
+                    recommendation=final_recommendation,
+                    notes=final_notes,
+                )
+            except ValidationError as exc:
+                return SaveJobResult(
+                    success=False, error="invalid_input", message=str(exc)
+                )
+
+            try:
+                if updated:
+                    conn.execute(
+                        "UPDATE jobs SET url=?, custom_title=?, title=?, company=?, "
+                        "country=?, score=?, recommendation=?, notes=?, analyzed_at=? "
+                        "WHERE id=?",
+                        (
+                            final_url,
+                            final_custom_title,
+                            title,
+                            company,
+                            country,
+                            final_score,
+                            final_recommendation,
+                            final_notes,
+                            analyzed_at,
+                            target_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO jobs (id, url, custom_title, title, company, "
+                        "country, status, score, recommendation, notes, analyzed_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            target_id,
+                            final_url,
+                            final_custom_title,
+                            title,
+                            company,
+                            country,
+                            final_status,
+                            final_score,
+                            final_recommendation,
+                            final_notes,
+                            analyzed_at,
+                        ),
+                    )
+            except sqlite3.IntegrityError as exc:
+                if "url" in str(exc).lower():
+                    return SaveJobResult(
+                        success=False,
+                        error="duplicate_url",
+                        message=f"Another job already has url {final_url!r}.",
+                    )
+                raise
+
+            if jd_text is not None:
+                conn.execute(
+                    "INSERT INTO job_descriptions (job_id, jd_text) VALUES (?, ?) "
+                    "ON CONFLICT(job_id) DO UPDATE SET jd_text = excluded.jd_text",
+                    (target_id, jd_text),
+                )
+
+            possible_duplicate_id = None
+            if not updated and final_url is None:
+                dup = conn.execute(
+                    "SELECT id FROM jobs WHERE company = ? AND title = ? AND id != ?",
+                    (company, title, target_id),
+                ).fetchone()
+                if dup is not None:
+                    possible_duplicate_id = dup["id"]
+
+            message = None
+            if not updated and final_url is None:
+                message = (
+                    f"Saved with custom_title={final_custom_title!r} and "
+                    f"id={target_id!r} — no url was given. Keep the id: pass "
+                    f"it back as `id` to set_application_status or a future "
+                    f"save_job_analysis update to reach this record again."
+                )
+
+            return SaveJobResult(
+                success=True,
+                id=target_id,
+                url=final_url,
+                custom_title=final_custom_title,
+                updated=updated,
+                possible_duplicate_id=possible_duplicate_id,
+                message=message,
+                storage_path=None,
+            )
+    except ValueError as exc:
+        return SaveJobResult(success=False, error="corrupt", message=str(exc))
 
 
 def list_jobs(
     since: str | None = None,
     status: str | list[str] | None = None,
     min_score: int | None = None,
+    company: str | None = None,
     limit: int | None = None,
     sort_by: str = "analyzed_at",
 ) -> ListJobsResult:
     """Return stored job records with optional filtering, sorting, and limiting.
 
-    Pipeline order: FILTER → SORT → LIMIT. This tool NEVER raises.
+    Pipeline order: FILTER -> SORT -> LIMIT, expressed as WHERE/ORDER BY/
+    LIMIT (D9). Arguments are validated in Python BEFORE any SQL is built, so
+    an invalid status still produces the "use one of: ..." message rather
+    than a raw SQL error. This tool NEVER raises.
 
     Args:
-        since:     ISO-8601 string cutoff (inclusive). Only jobs where
-                   analyzed_at >= since are returned (lexicographic compare).
-        status:    One ApplicationStatus value, or a list of them to match any
-                   member of the group. Grouped questions ("what have I
-                   applied to" spans six of the seven statuses) are the
-                   caller's to name — the server filters by what it is given
-                   and never defines what "applied" or "active" means. Passing
-                   a list is what lets sort_by and limit apply to the group
-                   server-side instead of shipping the whole store back. None
-                   (default) applies no filter; an empty list is an error.
-        min_score: Minimum score threshold (inclusive). Jobs with score=None
-                   are excluded when this filter is active.
+        since:     ISO-8601 string cutoff (inclusive).
+        status:    One ApplicationStatus value, or a list to match any member.
+        min_score: Minimum score threshold (inclusive). None scores excluded.
+        company:   Substring match against company, case-insensitive
+                    (COLLATE NOCASE, ASCII-only). This is SC-1, the release's
+                    headline query ("did I apply to Acme?") — D9.
         limit:     Maximum number of records to return (after sort).
         sort_by:   "analyzed_at" (default, newest first) or "score"
                    (descending, None scores last).
@@ -439,25 +466,30 @@ def list_jobs(
         ListJobsResult with success=True and filtered/sorted records on
         success; success=False with error_message on failure.
     """
-    try:
-        store = _read_jobs()
-    except ValueError as exc:
-        return ListJobsResult(success=False, error_message=str(exc))
+    where_clauses: list[str] = []
+    params: list[object] = []
 
-    items = list(store.jobs)
+    if company is not None:
+        where_clauses.append("company LIKE ? ESCAPE '\\' COLLATE NOCASE")
+        params.append(f"%{_escape_like(company)}%")
 
-    # --- FILTER ---
     if since is not None:
         try:
-            since_dt = _parse_iso(since)
-            # Parse each stored timestamp too — a malformed record must surface
-            # as an error envelope, never raise to the MCP boundary.
-            items = [j for j in items if _parse_iso(j.analyzed_at) >= since_dt]
+            # Normalize to UTC before comparing — analyzed_at is ALWAYS
+            # stored UTC-normalized (server-stamped, and migration
+            # normalizes legacy rows too), but SQL compares TEXT
+            # lexicographically, not as instants. Comparing an un-normalized
+            # offset (e.g. "-05:00") against a "+00:00"-stamped value would
+            # silently compare the wrong characters (finding 4).
+            since_normalized = _normalize_timestamp(since)
         except ValueError as exc:
             return ListJobsResult(
                 success=False,
-                error_message=f"Invalid 'since' timestamp or corrupt record timestamp: {exc}",
+                error_message=f"Invalid 'since' timestamp: {exc}",
             )
+        where_clauses.append("analyzed_at >= ?")
+        params.append(since_normalized)
+
     if status is not None:
         if isinstance(status, str):
             requested = [status]
@@ -478,10 +510,10 @@ def list_jobs(
                     "Invalid status: empty list. Omit the filter to return every job."
                 ),
             )
-        wanted = set()
+        wanted = []
         for value in requested:
             try:
-                wanted.add(ApplicationStatus(value))
+                wanted.append(ApplicationStatus(value).value)
             except ValueError:
                 return ListJobsResult(
                     success=False,
@@ -490,107 +522,261 @@ def list_jobs(
                         f"{', '.join(m.value for m in ApplicationStatus)})"
                     ),
                 )
-        items = [j for j in items if j.status in wanted]
-    if min_score is not None:
-        items = [j for j in items if j.score is not None and j.score >= min_score]
+        placeholders = ", ".join("?" for _ in wanted)
+        where_clauses.append(f"status IN ({placeholders})")
+        params.extend(wanted)
 
-    # --- SORT ---
+    if min_score is not None:
+        where_clauses.append("score IS NOT NULL AND score >= ?")
+        params.append(min_score)
+
     if sort_by == "analyzed_at":
-        items = sorted(items, key=lambda j: j.analyzed_at, reverse=True)
+        order_clause = "ORDER BY analyzed_at DESC"
     elif sort_by == "score":
-        # Tuple key: (score is not None, score or 0) with reverse=True
-        # → True (1) sorts before False (0) under reverse → scored items first
-        # → among scored items, higher score wins
-        items = sorted(
-            items,
-            key=lambda j: (j.score is not None, j.score if j.score is not None else 0),
-            reverse=True,
-        )
+        order_clause = "ORDER BY score DESC"
     else:
         return ListJobsResult(
             success=False,
             error_message=f"Invalid sort_by: {sort_by!r} (use 'analyzed_at' or 'score')",
         )
 
-    # --- LIMIT ---
     if limit is not None:
         if limit <= 0:
             return ListJobsResult(
                 success=False,
                 error_message="limit must be a positive integer",
             )
-        items = items[:limit]
 
-    return ListJobsResult(success=True, jobs=items, count=len(items))
+    sql = "SELECT * FROM jobs"
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += f" {order_clause}"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    try:
+        with connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            jobs = [_row_to_stored_job(r) for r in rows]
+    except ValueError as exc:
+        return ListJobsResult(success=False, error_message=str(exc))
+
+    return ListJobsResult(success=True, jobs=jobs, count=len(jobs))
 
 
 def set_application_status(
-    url: str, status: str, notes: str | None = None
+    status: str,
+    id: str | None = None,
+    url: str | None = None,
+    notes: str | None = None,
 ) -> SetStatusResult:
-    """Set the application status of a stored job record.
+    """Set the application status of a stored job record, by id or url.
 
     Transitions are deliberately UNVALIDATED — any of the 7 status values may
-    transition to any other (e.g. "rejected" -> "interviewing" succeeds; there
-    is no state machine). If ``notes`` is provided, updates the notes field;
-    otherwise leaves it unchanged. Returns success=False with
-    error="not_found" when no record matches ``url``, or error="invalid_status"
-    when ``status`` is not one of the 7 defined values. This tool NEVER raises.
+    transition to any other. If `notes` is provided, updates the notes field;
+    otherwise leaves it unchanged. This tool NEVER raises.
 
     Args:
-        url:    The job posting URL identifying the record to update.
         status: One of: not_applied, applied, interviewing, offer, rejected,
                 withdrawn, ghosted.
+        id:     Job id (preferred — always resolvable, unlike url).
+        url:    Alternate lookup key when id is not known.
         notes:  Optional notes to attach (replaces existing notes if provided).
 
     Returns:
-        SetStatusResult with success=True, url, status, and previous_status on
-        success; success=False with error="invalid_status" when status is not
-        recognized (record unchanged); success=False with error="not_found"
-        when no record matches; success=False with error/message on store
-        read/write failure.
+        SetStatusResult with success=True, id, url, status, previous_status
+        on success; success=False with error="invalid_status" (record
+        unchanged), error="not_found", or error/message on a store failure.
     """
+    try:
+        status_member = ApplicationStatus(status)
+    except ValueError:
+        return SetStatusResult(
+            success=False,
+            error="invalid_status",
+            message=(
+                f"Invalid status: {status!r} (use one of: "
+                f"{', '.join(m.value for m in ApplicationStatus)})"
+            ),
+        )
 
-    with store_lock(_JOBS_PATH):
-        try:
-            status_member = ApplicationStatus(status)
-        except ValueError:
-            return SetStatusResult(
-                success=False,
-                error="invalid_status",
-                message=(
-                    f"Invalid status: {status!r} (use one of: "
-                    f"{', '.join(m.value for m in ApplicationStatus)})"
-                ),
+    try:
+        with connect(write=True) as conn:
+            if id is not None:
+                row = _find_job_by_id(conn, id)
+            elif url is not None:
+                row = _find_job_by_url(conn, url)
+            else:
+                return SetStatusResult(
+                    success=False,
+                    error="invalid_input",
+                    message="Provide either 'id' or 'url'.",
+                )
+
+            if row is None:
+                return SetStatusResult(success=False, error="not_found")
+
+            previous_status = row["status"]
+            final_notes = notes if notes is not None else row["notes"]
+
+            conn.execute(
+                "UPDATE jobs SET status=?, notes=? WHERE id=?",
+                (status_member.value, final_notes, row["id"]),
             )
 
-        try:
-            store = _read_jobs()
-        except ValueError as exc:
-            return SetStatusResult(success=False, error="corrupt", message=str(exc))
+            return SetStatusResult(
+                success=True,
+                id=row["id"],
+                url=row["url"],
+                status=status_member.value,
+                previous_status=previous_status,
+                message=f"Status set to {status_member.value}.",
+            )
+    except ValueError as exc:
+        return SetStatusResult(success=False, error="corrupt", message=str(exc))
 
-        index = next((i for i, j in enumerate(store.jobs) if j.url == url), None)
-        if index is None:
-            return SetStatusResult(success=False, error="not_found")
 
-        record = store.jobs[index]
-        previous_status = record.status
-        updated_record = record.model_copy(
-            update={
-                "status": status_member,
-                "notes": notes if notes is not None else record.notes,
-            }
+def get_job(
+    id: str | None = None,
+    url: str | None = None,
+    custom_title: str | None = None,
+    include_description: bool = False,
+) -> GetJobResult:
+    """Retrieve a single job record by id, url, or custom_title (D6, the
+    REQUIRED read path for jd_text — without this tool, jd_text is
+    write-only).
+
+    `custom_title` exists as a lookup key because it exists as a SAVE
+    affordance: a job saved without a `url` is findable ONLY by the
+    `custom_title` the user agreed to (analyze.py's `_NO_URL_NOTICE`
+    promises exactly this). Without this parameter, that promise had no
+    retrieval path at all — a caller could only dump every job via
+    `list_jobs` and eyeball it.
+
+    `custom_title` is NOT unique (`save_job_analysis` deliberately never
+    matches an existing record by it — R3/SC-08), so a lookup CAN match more
+    than one job. Silently returning the first match would hide that
+    ambiguity from the caller and could resolve to the wrong job. Instead:
+    0 matches -> `not_found`; exactly 1 -> that job; more than 1 ->
+    `error="ambiguous"`, naming every matching id so the caller can retry
+    with a specific `id`.
+
+    `has_description` is ALWAYS present in the response, regardless of
+    `include_description` — it is the affordance that makes the jd_text
+    opt-in discoverable without dragging JD text into context by default.
+    Also returns the linked resume version SUMMARIES (no content) — the
+    headline query is "did I apply to X?" -> "yes, and with this resume."
+    (SC-22). The full text still comes from get_resume_version.
+
+    This tool NEVER raises.
+
+    Args:
+        id:                   Job id. Exactly one of id/url/custom_title
+                               must be given.
+        url:                  Alternate lookup key (url is UNIQUE).
+        custom_title:         Alternate lookup key for a URL-less job. NOT
+                               unique — see above for the multi-match rule.
+        include_description:  When True and a description was captured,
+                               populates `description` with the full pasted
+                               JD text. Defaults to False so a routine status
+                               check does not drag JD text into context.
+
+    Returns:
+        GetJobResult with success=True, job, description, has_description,
+        resume_versions on success; success=False with
+        error="not_found" | "invalid_input" | "corrupt" | "ambiguous" on
+        failure.
+    """
+    handles_given = sum(1 for h in (id, url, custom_title) if h is not None)
+    if handles_given != 1:
+        return GetJobResult(
+            success=False,
+            error="invalid_input",
+            message="Provide exactly one of 'id', 'url', or 'custom_title'.",
         )
-        store.jobs[index] = updated_record
 
-        try:
-            _write_jobs(store)
-        except Exception as exc:
-            return SetStatusResult(success=False, error="write_error", message=str(exc))
+    try:
+        with connect() as conn:
+            if id is not None:
+                row = _find_job_by_id(conn, id)
+                lookup_key, lookup_value = "id", id
+            elif url is not None:
+                row = _find_job_by_url(conn, url)
+                lookup_key, lookup_value = "url", url
+            else:
+                # Query directly against the already-open `conn` rather than
+                # calling `_find_job_ids_by_custom_title` (which opens its
+                # own connection) — avoids a needless nested connection
+                # while this one is already held open.
+                matching_ids = [
+                    r["id"]
+                    for r in conn.execute(
+                        "SELECT id FROM jobs WHERE custom_title = ?",
+                        (custom_title,),
+                    ).fetchall()
+                ]
+                if len(matching_ids) > 1:
+                    return GetJobResult(
+                        success=False,
+                        error="ambiguous",
+                        message=(
+                            f"{len(matching_ids)} jobs share custom_title "
+                            f"{custom_title!r} (ids: {matching_ids}). Pass "
+                            f"one of those as 'id' to disambiguate."
+                        ),
+                    )
+                row = _find_job_by_id(conn, matching_ids[0]) if matching_ids else None
+                lookup_key, lookup_value = "custom_title", custom_title
 
-        return SetStatusResult(
-            success=True,
-            url=url,
-            status=status_member.value,
-            previous_status=previous_status.value,
-            message=f"Status set to {status_member.value}.",
+            if row is None:
+                return GetJobResult(
+                    success=False,
+                    error="not_found",
+                    message=f"No job exists with {lookup_key} {lookup_value!r}.",
+                )
+
+            job = _row_to_stored_job(row)
+
+            desc_row = conn.execute(
+                "SELECT jd_text FROM job_descriptions WHERE job_id = ?", (job.id,)
+            ).fetchone()
+            has_description = desc_row is not None
+            description = (
+                desc_row["jd_text"]
+                if (include_description and desc_row is not None)
+                else None
+            )
+
+            # Explicit summary columns, not `SELECT *` (finding 5): this
+            # runs on the DEFAULT include_description=False path too, so a
+            # SELECT * here would pull every linked version's full `content`
+            # (often the largest column in the schema) just to build
+            # summaries that discard it — the same context-cost principle
+            # the job_descriptions side table exists to enforce for jd_text.
+            version_rows = conn.execute(
+                "SELECT id, label, parent_id, job_id, created_at "
+                "FROM resume_versions WHERE job_id = ? ORDER BY created_at DESC",
+                (job.id,),
+            ).fetchall()
+    except ValueError as exc:
+        return GetJobResult(success=False, error="corrupt", message=str(exc))
+
+    resume_versions = [
+        ResumeVersionSummary(
+            id=r["id"],
+            label=r["label"],
+            parent_id=r["parent_id"],
+            job_id=r["job_id"],
+            created_at=r["created_at"],
         )
+        for r in version_rows
+    ]
+
+    return GetJobResult(
+        success=True,
+        job=job,
+        description=description,
+        has_description=has_description,
+        resume_versions=resume_versions,
+    )

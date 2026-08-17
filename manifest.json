@@ -2,9 +2,9 @@
   "mcpb_version": "0.1",
   "name": "runway-mcp",
   "display_name": "runwayMCP",
-  "version": "0.2.0",
-  "description": "Job-fit filter for international students — fetch jobs, check H-1B visa sponsorship, and score CV match in one call.",
-  "long_description": "runwayMCP gives Claude the real data it needs to evaluate job postings for international students (F-1/OPT) seeking US roles.\n\n**What it does in one call (`analyze_job`):**\n- Fetches the job posting from Greenhouse, Ashby, Lever, or any board with schema.org markup\n- Checks the company's H-1B sponsorship history against USCIS data\n- Loads your stored general resume text so Claude can score the match (0–100)\n- Returns an `APPLY / CONSIDER / SKIP` recommendation\n\n**Setup:** After installing, tell Claude to save your resume: *\"Save my resume text with save_resume_version\"* (paste or point Claude at your CV — Claude drafts the text, the server just stores it).\n\n**Supported job boards:** Greenhouse, Ashby, Lever, and any board that embeds `schema.org/JobPosting` markup (many Workday and ADP pages work via generic fallback).\n\n**How it works:** The tools fetch and shape data; Claude drafts and tailors your resume text, scores the fit, and decides what to save. No MCP sampling is used, so it works on any host.",
+  "version": "0.3.0",
+  "description": "A memory for your job hunt: which jobs you applied to, what state each is in, and which resume version you sent — plus a live work-authorization warning.",
+  "long_description": "runwayMCP remembers your job hunt so you don't have to. Paste a job description into the conversation — the server never fetches it — and Claude extracts the title, company, and country; runwayMCP persists the record, your application status across 7 states, and every tailored resume version you send, linked to the job it was written for.\n\n**The headline query:** \"did I apply to Datadog?\" → `list_jobs(company=\"Datadog\")` → \"yes, and here's the exact resume you sent\" (`get_job` → linked resume versions → `get_resume_version`).\n\n**What it does in one call (`analyze_job`):**\n- Loads your general resume text so Claude can score the fit against the pasted posting (0–100)\n- Compares the job's country against the countries you've declared you may legally work in, and warns on a mismatch — computed live, never cached\n- Returns a scoring rubric Claude applies to produce an `APPLY / CONSIDER / SKIP` recommendation\n\n**Setup:** Tell Claude to save your resume (`save_resume_version`) and declare where you may legally work (`set_work_authorization`) — both are one-time steps before the first `analyze_job` call.\n\n**Storage:** A single local SQLite database. Upgrading from a pre-0.3.0 install migrates your existing `jobs.json`/`resumes.json` automatically and backs up the originals — no action needed.\n\n**How it works:** The tools persist and shape data; Claude drafts and tailors your resume text, scores the fit, and decides what to save. No MCP sampling is used, so it works on any host.",
   "author": {
     "name": "satovar16",
     "url": "https://github.com/satovarb16"
@@ -15,35 +15,32 @@
   },
   "support": "https://github.com/satovarb16/runwayMCP/issues",
   "license": "MIT",
-  "keywords": ["jobs", "visa", "h1b", "international students", "f1", "opt", "career"],
+  "keywords": [
+    "jobs",
+    "job search",
+    "resume",
+    "application tracker",
+    "work authorization",
+    "career"
+  ],
   "server": {
     "type": "python",
     "entry_point": "server.py",
     "mcp_config": {
       "command": "uvx",
-      "args": ["runway-mcp"]
+      "args": [
+        "runway-mcp"
+      ]
     }
   },
   "tools": [
     {
       "name": "analyze_job",
-      "description": "One-call data gatherer: fetch job + check H-1B visa sponsorship + load your general resume + return a scoring guide. Claude scores the fit and gives an APPLY/CONSIDER/SKIP recommendation."
-    },
-    {
-      "name": "fetch_job_posting",
-      "description": "Fetch and parse a job posting from a URL (Greenhouse, Ashby, Lever, or generic fallback)."
-    },
-    {
-      "name": "check_visa_sponsorship",
-      "description": "Check a company's H-1B sponsorship history against USCIS data. Returns GREEN/YELLOW/RED verdict."
-    },
-    {
-      "name": "get_profile",
-      "description": "Read-only migration hatch: returns a legacy structured CV profile if one exists, so Claude can re-save it as resume text. Removed in 0.3.0."
+      "description": "Loads your general resume and a scoring guide for a job you are evaluating. Claude scores the match against the job posting text in the conversation and applies the APPLY/CONSIDER/SKIP rules; the server does not fetch postings or score."
     },
     {
       "name": "save_resume_version",
-      "description": "Save a new resume version (raw text). The first save with parent_id=None establishes your general resume; later saves can tailor it for a specific job via parent_id and job_url."
+      "description": "Save a new resume version (raw text). The first save with parent_id=None establishes your general resume; later saves can tailor it for a specific job via parent_id and job_id — job_id must reference a job already saved with save_job_analysis, so call that first."
     },
     {
       "name": "get_resume_version",
@@ -51,23 +48,35 @@
     },
     {
       "name": "list_resume_versions",
-      "description": "List saved resume versions (newest first), optionally filtered by job_url. Returns summaries, not full text."
+      "description": "List saved resume versions (newest first), optionally filtered by job_id. Returns summaries, not full text."
     },
     {
       "name": "save_job_analysis",
-      "description": "Persist an analyzed job's title, company, visa verdict, score, and recommendation. Upserts by URL."
+      "description": "Persist an analyzed job's title, company, country, score, and recommendation, plus the full pasted job description (jd_text). Requires a url and/or a custom_title (the handle used to find this record again). Upserts by id, then by url."
+    },
+    {
+      "name": "get_job",
+      "description": "Retrieve a single stored job by id, url, or custom_title, with linked resume version summaries. include_description=True also returns the full pasted job description."
     },
     {
       "name": "list_jobs",
-      "description": "List stored job records, optionally filtered by application status (one value or a list), minimum score, or date, sorted and limited."
+      "description": "List stored job records, optionally filtered by company (substring match), application status (one value or a list), minimum score, or date, sorted and limited."
     },
     {
       "name": "set_application_status",
       "description": "Set a stored job's application status (not_applied, applied, interviewing, offer, rejected, withdrawn, ghosted). Any status can transition to any other."
+    },
+    {
+      "name": "set_work_authorization",
+      "description": "Declare the full list of countries you may legally work in (replaces any prior declaration). Required before analyze_job will run: it compares each job's country against this list live and warns on a mismatch, but never blocks or stores the result."
     }
   ],
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "python": ">=3.11"
     }

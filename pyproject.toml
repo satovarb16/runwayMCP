@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runway-mcp"
-version = "0.2.0"
-description = "An MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT)."
+version = "0.3.0"
+description = "An MCP server that remembers your job hunt: applications, statuses, and which resume version you sent to each job — plus a live work-authorization warning."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "satovarb" }]
-keywords = ["mcp", "visa", "sponsorship", "f-1", "opt", "job-search"]
+keywords = ["mcp", "job-search", "resume", "application-tracker", "work-authorization"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -20,10 +20,6 @@ classifiers = [
 dependencies = [
     "mcp>=1.2,<2",
     "pydantic>=2",
-    "requests",
-    "beautifulsoup4",
-    "rapidfuzz",
-    "filelock>=3.13",
 ]
 
 [project.urls]
@@ -37,13 +33,8 @@ runway-mcp = "server:main"
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pytest-asyncio",
-    "responses",
     "pre-commit",
     "ruff==0.15.18",
-]
-browser = [
-    "playwright>=1.40",
 ]
 
 [tool.setuptools]
@@ -54,7 +45,6 @@ include = ["tools*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 markers = [
     "contract: contract tests that pin the Pydantic output shape",
     "integration: tests that launch or import the full server",

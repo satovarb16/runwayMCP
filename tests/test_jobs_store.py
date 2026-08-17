@@ -1,158 +1,705 @@
-"""Tests for tools/jobs_store.py — persistence layer for analyzed job records.
+"""Tests for tools/jobs_store.py — SQLite-backed job store (design D1, D10).
 
-Follows the same structure as test_profile_tools.py:
-- monkeypatch _JOBS_PATH for isolation
-- pass path= directly to helpers for unit-level tests
-- @pytest.mark.contract for pydantic shape-pinning tests
-- @pytest.mark.integration for server-registration tests (in test_server.py)
+get_job and list_jobs's company filter are PR3a's, not tested here. Covers
+save_job_analysis (SC-01..SC-10, SC-14 write-half), list_jobs (unchanged
+contract, now SQL-backed), set_application_status (+id), and the PR#32
+omitted-argument regression — flagged by design as "the single most likely
+place for a silently-passing-but-wrong test in this release", so its fixture
+carries non-default prior values throughout (task 2.4j).
 """
 
 from __future__ import annotations
-
-import json
-import re
-from pathlib import Path
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Helpers / fixtures
-# ---------------------------------------------------------------------------
-
-
-def _patch_jobs_path(monkeypatch, tmp_path: Path) -> Path:
-    """Redirect _JOBS_PATH to a temp location, mirroring _patch_profile_path."""
-    import tools.jobs_store as jobs_store_mod
-
-    new_path = tmp_path / "jobs.json"
-    monkeypatch.setattr(jobs_store_mod, "_JOBS_PATH", new_path)
-    return new_path
-
-
-def _make_job(**overrides) -> dict:
-    """Factory for a minimal valid StoredJob-compatible dict."""
-    base = {
-        "url": "https://example.com/job/1",
-        "title": "Software Engineer",
-        "company": "Acme Corp",
-        "visa_verdict": "GREEN",
-        "analyzed_at": "2025-06-01T00:00:00+00:00",
-        "status": "not_applied",
-        "score": None,
-        "recommendation": None,
-        "notes": None,
-    }
-    base.update(overrides)
-    return base
-
-
-# ---------------------------------------------------------------------------
-# T-01 / T-02: Pydantic model contract tests (SC-01, SC-02)
+# Model contract
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
-def test_stored_job_defaults():
-    """SC-01: StoredJob with only required fields → optional fields default correctly."""
+def test_stored_job_has_no_visa_verdict_field():
+    from tools.jobs_store import StoredJob
+
+    assert "visa_verdict" not in StoredJob.model_fields
+
+
+@pytest.mark.contract
+def test_stored_job_has_id_custom_title_country():
     from tools.jobs_store import StoredJob
 
     job = StoredJob(
-        url="https://example.com/job/1",
-        title="Engineer",
+        id="J1",
+        url="https://ex.com/1",
+        custom_title=None,
+        title="SWE",
         company="Acme",
-        visa_verdict="GREEN",
-        analyzed_at="2025-01-01T00:00:00Z",
+        country="USA",
+        status="not_applied",
+        analyzed_at="2025-01-01T00:00:00+00:00",
     )
-
-    assert job.status == "not_applied"
-    assert job.score is None
-    assert job.recommendation is None
-    assert job.notes is None
+    assert job.id == "J1"
+    assert job.country == "USA"
 
 
 @pytest.mark.contract
-def test_stored_job_all_fields():
-    """StoredJob stores all optional fields when provided."""
+def test_stored_job_rejects_unknown_fields():
+    from pydantic import ValidationError
+
     from tools.jobs_store import StoredJob
 
-    job = StoredJob(
-        url="https://example.com/job/2",
-        title="PM",
-        company="Beta",
-        visa_verdict="YELLOW",
-        analyzed_at="2025-03-01T00:00:00Z",
-        status="applied",
-        score=75,
-        recommendation="APPLY",
-        notes="Looks good",
+    with pytest.raises(ValidationError):
+        StoredJob(
+            id="J1",
+            url="https://ex.com/1",
+            title="SWE",
+            company="Acme",
+            country="USA",
+            analyzed_at="2025-01-01T00:00:00+00:00",
+            visa_verdict="GREEN",
+        )
+
+
+# ---------------------------------------------------------------------------
+# R1 / SC-01..SC-03: at least one handle required
+# ---------------------------------------------------------------------------
+
+
+def test_sc01_creation_with_url_only(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    result = save_job_analysis(
+        url="https://example.com/job/1", title="SWE", company="Acme", country="USA"
     )
-
-    assert job.status == "applied"
-    assert job.score == 75
-    assert job.recommendation == "APPLY"
-    assert job.notes == "Looks good"
-
-
-@pytest.mark.contract
-def test_job_store_default_empty():
-    """SC-02: JobStore() with no arguments → jobs = []."""
-    from tools.jobs_store import JobStore
-
-    store = JobStore()
-
-    assert store.jobs == []
-
-
-@pytest.mark.contract
-def test_save_job_result_shape():
-    """SaveJobResult exposes the documented field names and defaults."""
-    from tools.jobs_store import SaveJobResult
-
-    result = SaveJobResult(success=True)
 
     assert result.success is True
+    assert result.id is not None
+    assert result.url == "https://example.com/job/1"
+    assert result.custom_title is None
+
+
+def test_sc02_creation_with_custom_title_only_carries_remember_message(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    result = save_job_analysis(
+        custom_title="Acme referral role", title="SWE", company="Acme", country="USA"
+    )
+
+    assert result.success is True
+    assert result.id is not None
     assert result.url is None
-    assert result.updated is None
-    assert result.storage_path is None
-    assert result.error_message is None
+    assert result.custom_title == "Acme referral role"
+    assert result.message is not None
+    assert "custom" in result.message.lower() or "title" in result.message.lower()
 
 
-@pytest.mark.contract
-def test_list_jobs_result_shape():
-    """ListJobsResult exposes the documented field names and defaults."""
-    from tools.jobs_store import ListJobsResult
+def test_sc03_neither_url_nor_custom_title_rejected(db_path):
+    from tools.jobs_store import save_job_analysis
 
-    result = ListJobsResult(success=True)
+    result = save_job_analysis(title="SWE", company="Acme", country="USA")
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs().count == 0
+
+
+# ---------------------------------------------------------------------------
+# R2 / SC-04..SC-05: identity survives a URL supplied later
+# ---------------------------------------------------------------------------
+
+
+def test_sc04_supplying_url_later_preserves_id(db_path):
+    from tools.jobs_store import save_job_analysis
+    from tools.resumes import save_resume_version
+
+    created = save_job_analysis(
+        custom_title="Acme referral role", title="SWE", company="Acme", country="USA"
+    )
+    job_id = created.id
+
+    save_resume_version(
+        content="tailored", label="Tailored", parent_id=None, job_id=job_id
+    )
+
+    updated = save_job_analysis(
+        id=job_id,
+        url="https://example.com/job/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+    )
+
+    assert updated.success is True
+    assert updated.id == job_id
+    assert updated.url == "https://example.com/job/1"
+    assert updated.custom_title == "Acme referral role"  # preserved, omitted this call
+
+
+def test_sc05_unknown_id_on_explicit_update_rejected(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    result = save_job_analysis(
+        id="ghost", url="https://ex.com/x", title="X", company="Y", country="Z"
+    )
+
+    assert result.success is False
+    assert result.error == "not_found"
+
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs().count == 0
+
+
+# ---------------------------------------------------------------------------
+# R3 / SC-06..SC-09: upsert semantics
+# ---------------------------------------------------------------------------
+
+
+def test_sc06_resave_same_url_updates_existing_id_unchanged(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    first = save_job_analysis(
+        url="https://example.com/job/1", title="SWE", company="Acme", country="USA"
+    )
+    second = save_job_analysis(
+        url="https://example.com/job/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        score=80,
+    )
+
+    assert second.success is True
+    assert second.id == first.id
+    assert second.updated is True
+
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs().count == 1
+
+
+def test_sc07_new_url_creates_new_record(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    first = save_job_analysis(
+        url="https://example.com/job/1", title="SWE", company="Acme", country="USA"
+    )
+    second = save_job_analysis(
+        url="https://example.com/job/2", title="Other", company="Beta", country="USA"
+    )
+
+    assert second.success is True
+    assert second.id != first.id
+
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs().count == 2
+
+
+def test_sc08_resave_same_custom_title_never_matches(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    first = save_job_analysis(
+        custom_title="Referral role", title="SWE", company="Acme", country="USA"
+    )
+    second = save_job_analysis(
+        custom_title="Referral role", title="SWE", company="Acme", country="USA"
+    )
+
+    assert second.success is True
+    assert second.id != first.id
+
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs().count == 2
+
+
+def test_sc09_setting_url_to_one_owned_by_another_job_rejected(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    job_a = save_job_analysis(
+        url="https://example.com/job/1", title="X", company="Y", country="Z"
+    )
+    job_b = save_job_analysis(custom_title="B", title="X", company="Y", country="Z")
+
+    result = save_job_analysis(
+        id=job_b.id,
+        url="https://example.com/job/1",
+        title="X",
+        company="Y",
+        country="Z",
+    )
+
+    assert result.success is False
+    assert result.error == "duplicate_url"
+
+    from tools.jobs_store import list_jobs
+
+    jobs = {j.id: j for j in list_jobs().jobs}
+    assert jobs[job_b.id].url is None  # unchanged
+    assert jobs[job_a.id].url == "https://example.com/job/1"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# SC-10 — highest-risk silently-passing test: prior values are non-default
+# ---------------------------------------------------------------------------
+
+
+def test_sc10_omitted_optional_fields_preserve_prior_nondefault_values(db_path):
+    """The fixture's prior notes/score/recommendation/status are all
+    non-default, so this test fails under BOTH a correct partial UPDATE and
+    (crucially) is the only shape that would also fail under an incorrect
+    full overwrite with defaults — a fixture with all-None priors passes
+    under both implementations and proves nothing (design §14)."""
+    from tools.jobs_store import save_job_analysis, set_application_status
+
+    created = save_job_analysis(
+        url="https://example.com/job/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        score=70,
+        recommendation="CONSIDER",
+        notes="keep me",
+    )
+    set_application_status(id=created.id, status="interviewing")
+
+    result = save_job_analysis(
+        id=created.id,
+        url=None,
+        title="SWE",
+        company="Acme",
+        country="USA",
+        score=85,  # explicit — must overwrite
+    )
+
+    assert result.success is True
+
+    from tools.jobs_store import list_jobs
+
+    record = list_jobs().jobs[0]
+    assert record.score == 85  # explicit arg wins
+    assert record.recommendation == "CONSIDER"  # omitted — preserved
+    assert record.notes == "keep me"  # omitted — preserved
+    assert record.status == "interviewing"  # never touched by save_job_analysis
+
+
+# ---------------------------------------------------------------------------
+# SC-14 (write-half): jd_text optional, round-trips through job_descriptions
+# ---------------------------------------------------------------------------
+
+
+def test_sc14_jd_text_omitted_on_save_leaves_no_job_descriptions_row(db_path):
+    from tools.jobs_store import save_job_analysis
+    from tools._db import connect
+
+    result = save_job_analysis(
+        url="https://example.com/1", title="SWE", company="Acme", country="USA"
+    )
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM job_descriptions WHERE job_id = ?", (result.id,)
+        ).fetchone()
+    assert row is None
+
+
+def test_jd_text_provided_writes_job_descriptions_row(db_path):
+    from tools.jobs_store import save_job_analysis
+    from tools._db import connect
+
+    result = save_job_analysis(
+        url="https://example.com/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        jd_text="Full posting...\nwith newlines",
+    )
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT jd_text FROM job_descriptions WHERE job_id = ?", (result.id,)
+        ).fetchone()
+    assert row["jd_text"] == "Full posting...\nwith newlines"
+
+
+def test_jd_text_omitted_on_update_leaves_existing_jd_text_unchanged(db_path):
+    from tools.jobs_store import save_job_analysis
+    from tools._db import connect
+
+    created = save_job_analysis(
+        url="https://example.com/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        jd_text="original JD",
+    )
+    save_job_analysis(
+        id=created.id, url=None, title="SWE", company="Acme", country="USA"
+    )
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT jd_text FROM job_descriptions WHERE job_id = ?", (created.id,)
+        ).fetchone()
+    assert row["jd_text"] == "original JD"
+
+
+# ---------------------------------------------------------------------------
+# list_jobs — unchanged contract, now SQL-backed
+# ---------------------------------------------------------------------------
+
+
+def test_list_jobs_empty_store_returns_empty(db_path):
+    from tools.jobs_store import list_jobs
+
+    result = list_jobs()
 
     assert result.success is True
     assert result.jobs == []
     assert result.count == 0
-    assert result.error_message is None
 
 
-@pytest.mark.contract
-def test_set_status_result_shape():
-    """SetStatusResult exposes the documented field names and defaults (SC-18)."""
-    from tools.jobs_store import SetStatusResult
+def test_list_jobs_status_filter_and_min_score(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status, list_jobs
 
-    result = SetStatusResult(success=False, error="not_found")
+    a = save_job_analysis(
+        url="https://a.com", title="A", company="A", country="US", score=90
+    )
+    set_application_status(id=a.id, status="applied")
+    save_job_analysis(
+        url="https://b.com", title="B", company="B", country="US", score=50
+    )
+
+    result = list_jobs(status="applied", min_score=60)
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].url == "https://a.com"
+
+
+def test_list_jobs_status_list_and_invalid_member(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(url="https://a.com", title="A", company="A", country="US")
+
+    result = list_jobs(status=["applied", "bogus"])
+
+    assert result.success is False
+    assert "bogus" in result.error_message
+
+
+def test_list_jobs_sort_by_score_desc_none_last(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com", title="A", company="A", country="US", score=70
+    )
+    save_job_analysis(
+        url="https://b.com", title="B", company="B", country="US", score=90
+    )
+    save_job_analysis(url="https://c.com", title="C", company="C", country="US")
+
+    result = list_jobs(sort_by="score")
+
+    assert [j.url for j in result.jobs] == [
+        "https://b.com",
+        "https://a.com",
+        "https://c.com",
+    ]
+
+
+def test_list_jobs_limit_and_default_sort_newest_first(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(url="https://a.com", title="A", company="A", country="US")
+    save_job_analysis(url="https://b.com", title="B", company="B", country="US")
+
+    result = list_jobs()
+
+    assert result.jobs[0].url == "https://b.com"
+
+
+def test_list_jobs_invalid_sort_by_returns_error(db_path):
+    from tools.jobs_store import list_jobs
+
+    result = list_jobs(sort_by="bogus_field")
+
+    assert result.success is False
+    assert "bogus_field" in result.error_message
+
+
+def test_list_jobs_limit_zero_or_negative_returns_error(db_path):
+    from tools.jobs_store import list_jobs
+
+    assert list_jobs(limit=0).success is False
+    assert list_jobs(limit=-1).success is False
+
+
+def test_list_jobs_since_filter(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    # Stamp analyzed_at deterministically by monkeypatching is overkill here;
+    # instead rely on two saves in sequence and filter with a cutoff before
+    # both, then after both.
+    save_job_analysis(url="https://a.com", title="A", company="A", country="US")
+    result_before = list_jobs(since="2000-01-01T00:00:00Z")
+    result_after = list_jobs(since="2999-01-01T00:00:00Z")
+
+    assert result_before.count == 1
+    assert result_after.count == 0
+
+
+def test_list_jobs_since_filter_normalizes_offset_to_utc(db_path):
+    """Finding 4 (PR2 apply-fix review): `since` must be UTC-normalized
+    before the lexicographic string comparison against analyzed_at, which is
+    always stored '+00:00'-stamped. A `since` cutoff expressed with a
+    negative offset that is numerically AFTER a stored UTC timestamp must
+    exclude that record — comparing the raw un-normalized strings would
+    include it, because '09' < '10' even though 09:00-05:00 (14:00 UTC) is
+    LATER than 10:00+00:00."""
+    from tools._db import connect
+    from tools.jobs_store import list_jobs
+
+    with connect(db_path, write=True) as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, url, custom_title, title, company, country, "
+            "status, score, recommendation, notes, analyzed_at) VALUES "
+            "('J1', 'https://ex.com/1', NULL, 'T', 'C', NULL, 'not_applied', "
+            "NULL, NULL, NULL, '2025-06-01T10:00:00+00:00')"
+        )
+
+    result = list_jobs(since="2025-06-01T09:00:00-05:00")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_list_jobs_never_returns_jd_text_field(db_path):
+    """SC-15 (jobs half): the summary shape has no jd_text field at all."""
+    from tools.jobs_store import save_job_analysis, list_jobs, StoredJob
+
+    save_job_analysis(
+        url="https://a.com",
+        title="A",
+        company="A",
+        country="US",
+        jd_text="huge posting" * 500,
+    )
+
+    assert "jd_text" not in StoredJob.model_fields
+    result = list_jobs()
+    assert result.jobs[0].url == "https://a.com"
+
+
+# ---------------------------------------------------------------------------
+# D9 (task 3a.1h/3a.1i): list_jobs gains a `company` filter — substring,
+# COLLATE NOCASE. SC-1 is the release's headline query ("did I apply to
+# Acme?") and is unanswerable without this filter except by listing the
+# whole store.
+# ---------------------------------------------------------------------------
+
+
+def test_list_jobs_company_filter_substring_match(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+    save_job_analysis(
+        url="https://b.com/1", title="B", company="Beta Inc", country="US"
+    )
+
+    result = list_jobs(company="Acme")
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].company == "Acme Corp"
+
+
+def test_list_jobs_company_filter_is_case_insensitive(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="acme")
+
+    assert result.success is True
+    assert result.count == 1
+
+
+def test_list_jobs_company_filter_no_match_returns_empty(db_path):
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="Nonexistent")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_list_jobs_company_filter_combines_with_status_filter(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status, list_jobs
+
+    j1 = save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+    save_job_analysis(
+        url="https://a.com/2", title="B", company="Acme Corp", country="US"
+    )
+    set_application_status(id=j1.id, status="applied")
+
+    result = list_jobs(company="Acme", status="applied")
+
+    assert result.success is True
+    assert result.count == 1
+    assert result.jobs[0].id == j1.id
+
+
+def test_list_jobs_company_filter_escapes_percent_wildcard(db_path):
+    """Finding 3: '%' in the user's string must be a literal, not a SQL
+    LIKE wildcard — otherwise company='%' would match every row while the
+    caller believes they asked for a filtered result."""
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(
+        url="https://a.com/1", title="A", company="Acme Corp", country="US"
+    )
+
+    result = list_jobs(company="%")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_list_jobs_company_filter_escapes_underscore_wildcard(db_path):
+    """Finding 3: '_' in the user's string must be a literal, not a SQL
+    LIKE single-character wildcard — otherwise company='A_B' would match
+    'AxB'."""
+    from tools.jobs_store import save_job_analysis, list_jobs
+
+    save_job_analysis(url="https://a.com/1", title="A", company="AxB", country="US")
+
+    result = list_jobs(company="A_B")
+
+    assert result.success is True
+    assert result.count == 0
+
+
+# ---------------------------------------------------------------------------
+# set_application_status — now accepts id OR url
+# ---------------------------------------------------------------------------
+
+
+def test_set_application_status_by_id(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status, list_jobs
+
+    created = save_job_analysis(
+        url="https://a.com", title="A", company="A", country="US", notes="keep me"
+    )
+
+    result = set_application_status(id=created.id, status="applied")
+
+    assert result.success is True
+    record = list_jobs().jobs[0]
+    assert record.status == "applied"
+    assert record.notes == "keep me"
+
+
+def test_set_application_status_by_url(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status
+
+    save_job_analysis(url="https://a.com", title="A", company="A", country="US")
+
+    result = set_application_status(url="https://a.com", status="applied")
+
+    assert result.success is True
+    assert result.status == "applied"
+
+
+def test_set_application_status_invalid_status_rejected(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status
+
+    created = save_job_analysis(
+        url="https://a.com", title="A", company="A", country="US"
+    )
+
+    result = set_application_status(id=created.id, status="bogus")
+
+    assert result.success is False
+    assert result.error == "invalid_status"
+
+
+def test_set_application_status_unknown_id_returns_not_found(db_path):
+    from tools.jobs_store import set_application_status
+
+    result = set_application_status(id="ghost", status="applied")
 
     assert result.success is False
     assert result.error == "not_found"
-    assert result.url is None
-    assert result.status is None
-    assert result.previous_status is None
-    assert result.message is None
+
+
+def test_set_application_status_free_transition_any_to_any(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status
+
+    created = save_job_analysis(
+        url="https://a.com", title="A", company="A", country="US"
+    )
+    set_application_status(id=created.id, status="rejected")
+
+    result = set_application_status(id=created.id, status="interviewing")
+
+    assert result.success is True
+    assert result.status == "interviewing"
+
+
+# ---------------------------------------------------------------------------
+# Corruption / error-envelope discipline
+# ---------------------------------------------------------------------------
+
+
+def test_list_jobs_on_missing_database_is_normal_not_error(db_path):
+    from tools.jobs_store import list_jobs
+
+    result = list_jobs()
+
+    assert result.success is True
+    assert result.count == 0
+
+
+def test_save_job_analysis_never_raises_on_bad_score_type(db_path):
+    from tools.jobs_store import save_job_analysis
+
+    result = save_job_analysis(
+        url="https://a.com",
+        title="A",
+        company="A",
+        country="US",
+        score="not-a-valid-int-string",  # type: ignore[arg-type]
+    )
+
+    assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# ApplicationStatus enum — unchanged 7 values
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.contract
 def test_application_status_has_exactly_seven_values():
-    """SC-18: exactly these 7 string values are valid application statuses."""
     from tools.jobs_store import ApplicationStatus
 
     values = {member.value for member in ApplicationStatus}
-
     assert values == {
         "not_applied",
         "applied",
@@ -165,1356 +712,412 @@ def test_application_status_has_exactly_seven_values():
 
 
 # ---------------------------------------------------------------------------
-# T-03 / T-04: _read_jobs and _write_jobs (SC-16, SC-17 partial, SC-18, SC-19)
+# D10 advisory: possible_duplicate_id on a URL-less insert matching an
+# existing job's (company, title) — non-blocking, per design's "the user has
+# the id to reconcile them" reasoning. Not gated by an explicit spec SC, but
+# implemented per design D10 and tested here rather than left unverified.
 # ---------------------------------------------------------------------------
 
 
-def test_read_jobs_missing_returns_empty_store(tmp_path):
-    """SC-19: _read_jobs on a missing file returns JobStore(jobs=[]) — not an error."""
-    from tools.jobs_store import _read_jobs, JobStore
+def test_url_less_insert_matching_company_and_title_flags_possible_duplicate(db_path):
+    from tools.jobs_store import save_job_analysis
 
-    missing = tmp_path / "does_not_exist.json"
-    result = _read_jobs(path=missing)
+    first = save_job_analysis(
+        url="https://example.com/job/1", title="SWE", company="Acme", country="USA"
+    )
 
-    assert isinstance(result, JobStore)
-    assert result.jobs == []
+    result = save_job_analysis(
+        custom_title="Referral for the same role",
+        title="SWE",
+        company="Acme",
+        country="USA",
+    )
 
-
-def test_read_jobs_valid_file(tmp_path):
-    """_read_jobs on a valid file returns the correct JobStore."""
-    from tools.jobs_store import _read_jobs, JobStore
-
-    jobs_path = tmp_path / "jobs.json"
-    job_dict = _make_job()
-    payload = {"jobs": [job_dict]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-
-    assert isinstance(result, JobStore)
-    assert len(result.jobs) == 1
-    assert result.jobs[0].url == job_dict["url"]
+    assert result.success is True  # advisory only — never blocks
+    assert result.possible_duplicate_id == first.id
 
 
-def test_read_jobs_corrupt_raises_value_error(tmp_path):
-    """SC-16: _read_jobs on corrupt JSON raises ValueError mentioning 'corrupt'."""
-    from tools.jobs_store import _read_jobs
-
-    corrupt_path = tmp_path / "jobs.json"
-    corrupt_path.write_text("not{json", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="(?i)corrupt"):
-        _read_jobs(path=corrupt_path)
-
-
-def test_write_jobs_creates_parent_dirs(tmp_path):
-    """_write_jobs creates parent directories if they do not exist."""
-    from tools.jobs_store import _write_jobs, JobStore
-
-    deep_path = tmp_path / "a" / "b" / "c" / "jobs.json"
-    store = JobStore()
-
-    _write_jobs(store, path=deep_path)
-
-    assert deep_path.exists()
-
-
-def test_write_jobs_writes_valid_json(tmp_path):
-    """_write_jobs produces parseable JSON."""
-    from tools.jobs_store import _write_jobs, JobStore, StoredJob
-
-    jobs_path = tmp_path / "jobs.json"
-    job = StoredJob(**_make_job())
-    store = JobStore(jobs=[job])
-
-    _write_jobs(store, path=jobs_path)
-
-    raw = json.loads(jobs_path.read_text(encoding="utf-8"))
-    assert "jobs" in raw
-    assert len(raw["jobs"]) == 1
-
-
-def test_write_jobs_round_trips(tmp_path):
-    """_write_jobs followed by _read_jobs returns the same store."""
-    from tools.jobs_store import _write_jobs, _read_jobs, JobStore, StoredJob
-
-    jobs_path = tmp_path / "jobs.json"
-    job = StoredJob(**_make_job(score=80))
-    store = JobStore(jobs=[job])
-
-    _write_jobs(store, path=jobs_path)
-    result = _read_jobs(path=jobs_path)
-
-    assert len(result.jobs) == 1
-    assert result.jobs[0].score == 80
-
-
-def test_write_jobs_overwrites_existing(tmp_path):
-    """_write_jobs replaces an existing file."""
-    from tools.jobs_store import _write_jobs, _read_jobs, JobStore, StoredJob
-
-    jobs_path = tmp_path / "jobs.json"
-    # Write initial store with one job
-    job1 = StoredJob(**_make_job(url="https://example.com/1"))
-    _write_jobs(JobStore(jobs=[job1]), path=jobs_path)
-
-    # Overwrite with a different store
-    job2 = StoredJob(**_make_job(url="https://example.com/2"))
-    _write_jobs(JobStore(jobs=[job2]), path=jobs_path)
-
-    result = _read_jobs(path=jobs_path)
-    assert len(result.jobs) == 1
-    assert result.jobs[0].url == "https://example.com/2"
-
-
-def test_write_jobs_atomic_cleans_temp_on_error(tmp_path, monkeypatch):
-    """SC-18: on write failure, temp file is unlinked and original is intact."""
-    from tools.jobs_store import _write_jobs, StoredJob
-
-    jobs_path = tmp_path / "jobs.json"
-    original_content = json.dumps({"jobs": []})
-    jobs_path.write_text(original_content, encoding="utf-8")
-
-    # Force failure during write by making model_dump_json raise
-    import tools.jobs_store as jobs_store_mod
-
-    original_store = jobs_store_mod.JobStore
-
-    class BrokenStore(original_store):
-        def model_dump_json(self, **kwargs):
-            raise RuntimeError("simulated write failure")
-
-    job = StoredJob(**_make_job())
-    broken = BrokenStore(jobs=[job])
-
-    with pytest.raises(RuntimeError, match="simulated write failure"):
-        _write_jobs(broken, path=jobs_path)
-
-    # Original file is still intact
-    assert jobs_path.read_text(encoding="utf-8") == original_content
-    # No orphan temp files
-    temp_files = list(tmp_path.glob(".jobs_tmp_*"))
-    assert len(temp_files) == 0, f"Orphan temp files found: {temp_files}"
-
-
-def test_write_jobs_delegates_to_storage_atomic_write_json(tmp_path, monkeypatch):
-    """_write_jobs delegates atomic persistence to tools._storage.atomic_write_json."""
-    from tools.jobs_store import _write_jobs, JobStore
-    import tools._storage as storage_mod
-
-    jobs_path = tmp_path / "jobs.json"
-    store = JobStore(jobs=[])
-
-    calls = []
-
-    def fake_atomic_write_json(payload, path, *, tmp_prefix):
-        calls.append((payload, path, tmp_prefix))
-
-    monkeypatch.setattr(storage_mod, "atomic_write_json", fake_atomic_write_json)
-
-    _write_jobs(store, path=jobs_path)
-
-    assert len(calls) == 1
-    payload, path, tmp_prefix = calls[0]
-    assert payload is store
-    assert path == jobs_path
-    assert tmp_prefix == ".jobs_tmp_"
-
-
-# ---------------------------------------------------------------------------
-# T-05 / T-06: save_job_analysis (SC-03, SC-04, SC-05, SC-17)
-# ---------------------------------------------------------------------------
-
-
-def test_save_job_analysis_new_url_success(tmp_path, monkeypatch):
-    """SC-03: save_job_analysis on new url → success=True, updated=False, file created."""
-    _patch_jobs_path(monkeypatch, tmp_path)
+def test_url_less_insert_with_no_match_has_no_possible_duplicate(db_path):
     from tools.jobs_store import save_job_analysis
 
     result = save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=85,
-        recommendation="APPLY",
+        custom_title="Unique referral", title="SWE", company="Acme", country="USA"
     )
 
     assert result.success is True
-    assert result.updated is False
-    assert result.url == "https://example.com/job/1"
-    assert result.storage_path is not None
-
-
-def test_save_job_analysis_file_created_with_correct_fields(tmp_path, monkeypatch):
-    """SC-03: saved record has status="not_applied", score, recommendation stored verbatim."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-
-    save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=85,
-        recommendation="APPLY",
-    )
-
-    store = _read_jobs(path=jobs_path)
-    assert len(store.jobs) == 1
-    record = store.jobs[0]
-    assert record.status == "not_applied"
-    assert record.score == 85
-    assert record.recommendation == "APPLY"
-
-
-def test_save_job_analysis_server_stamps_analyzed_at(tmp_path, monkeypatch):
-    """SC-03: analyzed_at is a valid ISO-8601 string set by the server."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-    from datetime import datetime
-
-    save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-    )
-
-    store = _read_jobs(path=jobs_path)
-    analyzed_at = store.jobs[0].analyzed_at
-    # Must be parseable as ISO-8601
-    parsed = datetime.fromisoformat(analyzed_at)
-    assert parsed is not None
-
-
-def test_save_job_analysis_optional_fields_default_to_none(tmp_path, monkeypatch):
-    """SC-04: When optional fields are omitted, stored record has None values."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-
-    save_job_analysis(
-        url="https://example.com/job/2",
-        title="PM",
-        company="Beta",
-        visa_verdict="YELLOW",
-    )
-
-    store = _read_jobs(path=jobs_path)
-    record = store.jobs[0]
-    assert record.score is None
-    assert record.recommendation is None
-    assert record.notes is None
-
-
-def test_save_job_analysis_upsert_same_url(tmp_path, monkeypatch):
-    """SC-05: Upsert same url → success=True, updated=True, single record, latest wins."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-
-    save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer I",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=70,
-    )
-    result = save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer II",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=90,
-    )
-
-    assert result.success is True
-    assert result.updated is True
-
-    store = _read_jobs(path=jobs_path)
-    assert len(store.jobs) == 1
-    assert store.jobs[0].score == 90
-    assert store.jobs[0].title == "Engineer II"
-
-
-def test_save_job_analysis_corrupt_store_returns_error(tmp_path, monkeypatch):
-    """SC-17: corrupt store blocks save → success=False, error_message contains 'corrupt'."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    jobs_path.write_text("not{json", encoding="utf-8")
-    from tools.jobs_store import save_job_analysis
-
-    result = save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-    )
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert re.search("(?i)corrupt", result.error_message)
-    # SC-17: the corrupt file must be left untouched (no auto-repair / data loss).
-    assert jobs_path.read_text(encoding="utf-8") == "not{json"
-
-
-def test_save_job_analysis_storage_path_matches_injected(tmp_path, monkeypatch):
-    """SC-03: storage_path in result matches the injected path string."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis
-
-    result = save_job_analysis(
-        url="https://example.com/job/1",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-    )
-
-    assert result.storage_path == str(jobs_path.resolve())
+    assert result.possible_duplicate_id is None
 
 
 # ---------------------------------------------------------------------------
-# T-07 / T-08: list_jobs (SC-06..SC-12, SC-16, SC-20)
+# 2.6f: extra="forbid" still bites — an undeclared table column raises at
+# first read rather than being silently dropped.
 # ---------------------------------------------------------------------------
 
 
-def test_list_jobs_missing_store_returns_empty(tmp_path, monkeypatch):
-    """SC-06: list_jobs on missing store → success=True, count=0, jobs=[]."""
-    _patch_jobs_path(monkeypatch, tmp_path)
+def test_undeclared_column_on_jobs_raises_at_first_read(db_path):
+    from tools._db import connect
     from tools.jobs_store import list_jobs
 
-    result = list_jobs()
-
-    assert result.success is True
-    assert result.count == 0
-    assert result.jobs == []
-
-
-def test_list_jobs_since_filter(tmp_path, monkeypatch):
-    """SC-07: since filter excludes jobs before cutoff date."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(
-        **_make_job(url="https://a.com", analyzed_at="2025-01-01T00:00:00Z")
-    )
-    job_b = StoredJob(
-        **_make_job(url="https://b.com", analyzed_at="2025-06-01T00:00:00Z")
-    )
-    _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
-
-    result = list_jobs(since="2025-03-01T00:00:00Z")
-
-    assert result.success is True
-    assert result.count == 1
-    assert result.jobs[0].url == "https://b.com"
-
-
-def test_list_jobs_status_filter_exact_match(tmp_path, monkeypatch):
-    """SC-24: status='applied' returns only the job with that exact status."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(**_make_job(url="https://a.com", status="applied"))
-    job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
-    _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
-
-    result = list_jobs(status="applied")
-
-    assert result.success is True
-    assert result.count == 1
-    assert result.jobs[0].url == "https://a.com"
-
-
-def test_list_jobs_status_accepts_a_list_of_statuses(tmp_path, monkeypatch):
-    """A list matches any of its members, so grouped questions stay one call.
-
-    "What have I applied to" spans six of the seven statuses. The server does
-    not name that group — the caller passes the members it means.
-    """
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    jobs = [
-        StoredJob(**_make_job(url="https://a.com", status="applied")),
-        StoredJob(**_make_job(url="https://b.com", status="interviewing")),
-        StoredJob(**_make_job(url="https://c.com", status="offer")),
-        StoredJob(**_make_job(url="https://d.com", status="not_applied")),
-    ]
-    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
-
-    result = list_jobs(status=["applied", "interviewing", "offer"])
-
-    assert result.success is True
-    assert result.count == 3
-    assert "https://d.com" not in {j.url for j in result.jobs}
-
-
-def test_list_jobs_status_list_composes_with_sort_and_limit(tmp_path, monkeypatch):
-    """The point of filtering server-side: sort and limit apply to the group."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    jobs = [
-        StoredJob(**_make_job(url="https://low.com", status="applied", score=10)),
-        StoredJob(**_make_job(url="https://high.com", status="interviewing", score=95)),
-        StoredJob(**_make_job(url="https://mid.com", status="offer", score=50)),
-        StoredJob(**_make_job(url="https://top.com", status="not_applied", score=99)),
-    ]
-    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
-
-    result = list_jobs(
-        status=["applied", "interviewing", "offer"], sort_by="score", limit=2
-    )
-
-    assert result.success is True
-    assert [j.url for j in result.jobs] == ["https://high.com", "https://mid.com"]
-
-
-def test_list_jobs_status_list_with_invalid_member_returns_error(tmp_path, monkeypatch):
-    """One bad member invalidates the whole filter, and the error names it."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs
-
-    result = list_jobs(status=["applied", "bogus"])
-
-    assert result.success is False
-    assert "bogus" in result.error_message
-
-
-def test_list_jobs_empty_status_list_returns_error(tmp_path, monkeypatch):
-    """An empty filter is a caller mistake, not a request for zero rows.
-
-    Mirrors the existing limit=0 decision: surface an error envelope rather
-    than silently returning an empty result that looks like real data.
-    """
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs
-
-    result = list_jobs(status=[])
-
-    assert result.success is False
-    assert result.error_message
-
-
-def test_list_jobs_status_filter_is_exact_not_grouped(tmp_path, monkeypatch):
-    """SC-24: status filter is an exact match — 'interviewing' does NOT also
-    match 'applied' or other post-application statuses (unlike the old
-    boolean `applied` filter, which grouped every non-not_applied status)."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    statuses = ["applied", "interviewing", "offer", "rejected", "withdrawn", "ghosted"]
-    jobs = [StoredJob(**_make_job(url=f"https://{s}.com", status=s)) for s in statuses]
-    jobs.append(StoredJob(**_make_job(url="https://fresh.com", status="not_applied")))
-    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
-
-    result = list_jobs(status="interviewing")
-
-    assert result.success is True
-    assert result.count == 1
-    assert result.jobs[0].url == "https://interviewing.com"
-
-
-def test_list_jobs_status_none_returns_all(tmp_path, monkeypatch):
-    """SC-24: status=None (default) returns every record, unfiltered."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(**_make_job(url="https://a.com", status="applied"))
-    job_b = StoredJob(**_make_job(url="https://b.com", status="not_applied"))
-    _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
-
-    result = list_jobs(status=None)
-
-    assert result.success is True
-    assert result.count == 2
-
-
-def test_list_jobs_invalid_status_returns_error(tmp_path, monkeypatch):
-    """Unknown status value → success=False, error_message (mirrors sort_by guard)."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore
-
-    _write_jobs(JobStore(jobs=[]), path=jobs_path)
-
-    result = list_jobs(status="bogus_status")
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert "bogus_status" in result.error_message
-
-
-def test_list_jobs_min_score_filter(tmp_path, monkeypatch):
-    """SC-10: min_score excludes score=None and below-threshold scores."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(**_make_job(url="https://a.com", score=90))
-    job_b = StoredJob(**_make_job(url="https://b.com", score=50))
-    job_c = StoredJob(**_make_job(url="https://c.com", score=None))
-    _write_jobs(JobStore(jobs=[job_a, job_b, job_c]), path=jobs_path)
-
-    result = list_jobs(min_score=60)
-
-    assert result.success is True
-    assert result.count == 1
-    assert result.jobs[0].url == "https://a.com"
-
-
-def test_list_jobs_sort_by_score_descending_none_last(tmp_path, monkeypatch):
-    """SC-11: sort_by='score' → descending, score=None entries last."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(**_make_job(url="https://a.com", score=70))
-    job_b = StoredJob(**_make_job(url="https://b.com", score=90))
-    job_c = StoredJob(**_make_job(url="https://c.com", score=None))
-    _write_jobs(JobStore(jobs=[job_a, job_b, job_c]), path=jobs_path)
-
-    result = list_jobs(sort_by="score")
-
-    assert result.success is True
-    assert result.count == 3
-    assert result.jobs[0].url == "https://b.com"  # score=90 first
-    assert result.jobs[1].url == "https://a.com"  # score=70 second
-    assert result.jobs[2].url == "https://c.com"  # score=None last
-
-
-def test_list_jobs_limit_caps_count(tmp_path, monkeypatch):
-    """SC-12: limit caps the result to at most N records after sort."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    jobs = [
-        StoredJob(
-            **_make_job(
-                url=f"https://example.com/{i}",
-                analyzed_at=f"2025-0{i + 1}-01T00:00:00Z",
-            )
+    with connect(db_path, write=True) as conn:
+        conn.execute("ALTER TABLE jobs ADD COLUMN unexpected_future_column TEXT")
+        conn.execute(
+            "INSERT INTO jobs (id, url, custom_title, title, company, country, "
+            "status, score, recommendation, notes, analyzed_at, "
+            "unexpected_future_column) VALUES "
+            "('J1', 'https://ex.com/1', NULL, 'SWE', 'Acme', 'USA', "
+            "'not_applied', NULL, NULL, NULL, '2025-01-01T00:00:00+00:00', "
+            "'surprise')"
         )
-        for i in range(5)
-    ]
-    _write_jobs(JobStore(jobs=jobs), path=jobs_path)
-
-    result = list_jobs(limit=3)
-
-    assert result.success is True
-    assert result.count == 3
-    assert len(result.jobs) == 3
-
-
-def test_list_jobs_default_sort_newest_first(tmp_path, monkeypatch):
-    """SC-20: default sort is analyzed_at descending (newest first)."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    job_a = StoredJob(
-        **_make_job(url="https://a.com", analyzed_at="2025-01-01T00:00:00Z")
-    )
-    job_b = StoredJob(
-        **_make_job(url="https://b.com", analyzed_at="2025-06-01T00:00:00Z")
-    )
-    _write_jobs(JobStore(jobs=[job_a, job_b]), path=jobs_path)
-
-    result = list_jobs()
-
-    assert result.success is True
-    assert result.jobs[0].url == "https://b.com"  # newer first
-    assert result.jobs[1].url == "https://a.com"
-
-
-def test_list_jobs_corrupt_store_returns_error(tmp_path, monkeypatch):
-    """SC-16: list_jobs on corrupt store → success=False, error_message mentions corrupt."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    jobs_path.write_text("not{json", encoding="utf-8")
-    from tools.jobs_store import list_jobs
 
     result = list_jobs()
 
     assert result.success is False
     assert result.error_message is not None
-    assert re.search("(?i)corrupt", result.error_message)
-    # SC-16: list is read-only — the corrupt file must remain byte-for-byte intact.
-    assert jobs_path.read_text(encoding="utf-8") == "not{json"
-
-
-def test_list_jobs_invalid_sort_by_returns_error(tmp_path, monkeypatch):
-    """Unknown sort_by value → success=False, error_message."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore
-
-    _write_jobs(JobStore(jobs=[]), path=jobs_path)
-
-    result = list_jobs(sort_by="bogus_field")
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert "bogus_field" in result.error_message
 
 
 # ---------------------------------------------------------------------------
-# T-09 / T-10: set_application_status (SC-19..SC-23) and mark_applied removal (SC-30)
+# SC-22 (partial — full round-trip needs get_job, deferred to PR3a):
+# list_jobs -> list_resume_versions(job_id=...) -> get_resume_version chain.
 # ---------------------------------------------------------------------------
 
 
-def test_set_application_status_valid_forward_transition(tmp_path, monkeypatch):
-    """SC-19: not_applied -> applied succeeds, stored status updated."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-        StoredJob,
+def test_sc22_partial_cross_conversation_recall_without_get_job(db_path):
+    from tools.jobs_store import save_job_analysis, set_application_status, list_jobs
+    from tools.resumes import (
+        save_resume_version,
+        list_resume_versions,
+        get_resume_version,
     )
 
-    job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
+    job = save_job_analysis(
+        url="https://example.com/datadog", title="SWE", company="Datadog", country="US"
+    )
+    set_application_status(id=job.id, status="interviewing")
+    version = save_resume_version(
+        content="Datadog-tailored resume text",
+        label="Datadog — infra focus",
+        parent_id=None,
+        job_id=job.id,
+    )
 
-    result = set_application_status(url="https://example.com/job/1", status="applied")
+    found_jobs = list_jobs(status="interviewing")
+    assert found_jobs.count == 1
+    assert found_jobs.jobs[0].id == job.id
+
+    linked_versions = list_resume_versions(job_id=job.id)
+    assert linked_versions.count == 1
+    assert linked_versions.versions[0].id == version.id
+    assert linked_versions.versions[0].label == "Datadog — infra focus"
+
+    fetched = get_resume_version(id=version.id)
+    assert fetched.version.content == "Datadog-tailored resume text"
+
+
+# ---------------------------------------------------------------------------
+# get_job (D6, tasks 3a.1a-3a.1g/3a.1j/3a.1k) — REQUIRED new tool. Without
+# it jd_text is write-only, reachable through no read path.
+# ---------------------------------------------------------------------------
+
+
+def test_sc11_jd_text_stored_and_retrievable_via_get_job(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1",
+        title="SWE",
+        company="Acme",
+        country="USA",
+        jd_text="Full pasted description...\nwith newlines",
+    )
+
+    result = get_job(id=saved.id, include_description=True)
 
     assert result.success is True
-    assert result.url == "https://example.com/job/1"
-    assert result.status == "applied"
-
-    store = _read_jobs(path=jobs_path)
-    record = store.jobs[0]
-    assert record.status == "applied"
-    assert record.notes == "keep me"
+    assert result.job.id == saved.id
+    assert result.description == "Full pasted description...\nwith newlines"
+    assert result.has_description is True
 
 
-def test_set_application_status_free_transition_rejected_to_interviewing(
-    tmp_path, monkeypatch
-):
-    """SC-20: any->any transition is allowed — rejected -> interviewing succeeds
-    with no state-machine restriction."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-        StoredJob,
-    )
+def test_sc12_get_job_unknown_id_returns_not_found(db_path):
+    from tools.jobs_store import get_job
 
-    job = StoredJob(**_make_job(url="https://example.com/job/1", status="rejected"))
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
-
-    result = set_application_status(
-        url="https://example.com/job/1", status="interviewing"
-    )
-
-    assert result.success is True
-    assert result.status == "interviewing"
-
-    store = _read_jobs(path=jobs_path)
-    assert store.jobs[0].status == "interviewing"
-
-
-def test_set_application_status_invalid_status_rejected(tmp_path, monkeypatch):
-    """SC-21: unknown status string -> success=False, error='invalid_status';
-    the stored record is unchanged."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-        StoredJob,
-    )
-
-    job = StoredJob(**_make_job(url="https://example.com/job/1", status="applied"))
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
-
-    result = set_application_status(url="https://example.com/job/1", status="bogus")
-
-    assert result.success is False
-    assert result.error == "invalid_status"
-
-    store = _read_jobs(path=jobs_path)
-    assert store.jobs[0].status == "applied"  # unchanged
-
-
-def test_set_application_status_unknown_url_returns_not_found(tmp_path, monkeypatch):
-    """SC-22: unknown url -> success=False, error='not_found', no phantom record."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-    )
-
-    _write_jobs(JobStore(jobs=[]), path=jobs_path)
-
-    result = set_application_status(url="https://example.com/missing", status="applied")
+    result = get_job(id="ghost")
 
     assert result.success is False
     assert result.error == "not_found"
 
-    store = _read_jobs(path=jobs_path)
-    assert len(store.jobs) == 0
 
+def test_sc13_get_job_on_corrupt_store_returns_corrupt_not_not_found(db_path):
+    """A naive implementation that catches broadly and reports "not_found"
+    would wrongly suggest the id is simply wrong, when the whole store is
+    broken."""
+    from tools.jobs_store import get_job
 
-def test_set_application_status_no_notes_preserves_existing(tmp_path, monkeypatch):
-    """SC-23: no notes argument -> existing notes are preserved."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-        StoredJob,
-    )
+    db_path.write_bytes(b"not a database")
 
-    job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
-
-    result = set_application_status(
-        url="https://example.com/job/1", status="interviewing"
-    )
-
-    assert result.success is True
-    store = _read_jobs(path=jobs_path)
-    assert store.jobs[0].notes == "keep me"
-
-
-def test_set_application_status_with_notes_replaces_existing(tmp_path, monkeypatch):
-    """SC-23: notes argument provided -> notes is replaced."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import (
-        set_application_status,
-        _write_jobs,
-        _read_jobs,
-        JobStore,
-        StoredJob,
-    )
-
-    job = StoredJob(**_make_job(url="https://example.com/job/1", notes="keep me"))
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
-
-    result = set_application_status(
-        url="https://example.com/job/1", status="interviewing", notes="update"
-    )
-
-    assert result.success is True
-    store = _read_jobs(path=jobs_path)
-    assert store.jobs[0].notes == "update"
-
-
-def test_set_application_status_corrupt_store_returns_error(tmp_path, monkeypatch):
-    """set_application_status on corrupt store -> success=False with error info."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    jobs_path.write_text("not{json", encoding="utf-8")
-    from tools.jobs_store import set_application_status
-
-    result = set_application_status(url="https://example.com/job/1", status="applied")
+    result = get_job(id="J1")
 
     assert result.success is False
-    # error or message should be populated
-    assert result.error is not None or result.message is not None
+    assert result.error == "corrupt"
 
 
-def test_mark_applied_no_longer_exists():
-    """SC-30: mark_applied is absent, not deprecated — not importable from
-    tools.jobs_store."""
-    import tools.jobs_store as jobs_store_mod
-
-    assert not hasattr(jobs_store_mod, "mark_applied")
-    assert not hasattr(jobs_store_mod, "MarkAppliedResult")
-
-
-# ---------------------------------------------------------------------------
-# FIX 1: since filter timezone-format mismatch
-# ---------------------------------------------------------------------------
-
-
-def test_list_jobs_since_z_suffix_vs_plus00_stored(tmp_path, monkeypatch):
-    """FIX-1a: since='...Z' must include records stored with '+00:00' suffix at the same instant.
-
-    The bug: lexicographic compare '2025-06-01T12:00:00+00:00' >= '2025-06-01T12:00:00Z'
-    is False because '+' (43) < 'Z' (90). Proper datetime-aware compare fixes this.
-    """
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    # Stored with +00:00 suffix (as server stamps them)
-    job = StoredJob(
-        **_make_job(url="https://boundary.com", analyzed_at="2025-06-01T12:00:00+00:00")
-    )
-    _write_jobs(JobStore(jobs=[job]), path=jobs_path)
-
-    # since uses Z suffix for the SAME instant — raw string compare would wrongly EXCLUDE this
-    result = list_jobs(since="2025-06-01T12:00:00Z")
-
-    assert result.success is True
-    assert result.count == 1  # must be INCLUDED (boundary is inclusive)
-
-
-def test_list_jobs_since_invalid_returns_error(tmp_path, monkeypatch):
-    """FIX-1b: since='garbage' → success=False, no exception raised."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs
-
-    result = list_jobs(since="garbage")
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert (
-        "since" in result.error_message.lower()
-        or "timestamp" in result.error_message.lower()
-    )
-
-
-def test_list_jobs_since_corrupt_stored_timestamp_returns_error(tmp_path, monkeypatch):
-    """FIX-1 regression: a malformed stored analyzed_at must NOT raise to the MCP
-    boundary when a `since` filter is active — it returns an error envelope."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    payload = {"jobs": [_make_job(analyzed_at="not-a-timestamp")]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-    from tools.jobs_store import list_jobs
-
-    # Must return an envelope, never raise.
-    result = list_jobs(since="2020-01-01T00:00:00Z")
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert "timestamp" in result.error_message.lower()
-
-
-# ---------------------------------------------------------------------------
-# FIX 2: StoredJob construction outside try block
-# ---------------------------------------------------------------------------
-
-
-def test_save_job_analysis_invalid_score_returns_error(tmp_path, monkeypatch):
-    """FIX-2: invalid score (float with fraction) → success=False, no exception raised to boundary."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis
-
-    # score=85.5 is rejected by pydantic (int_from_float) — must NOT propagate
-    result = save_job_analysis(
-        url="https://example.com/job/invalid",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=85.5,  # type: ignore[arg-type]
-    )
-
-    assert result.success is False
-    assert result.error_message is not None
-
-
-# ---------------------------------------------------------------------------
-# FIX 3: upsert must preserve `status`
-# ---------------------------------------------------------------------------
-
-
-def test_save_job_analysis_upsert_preserves_score_and_recommendation(
-    tmp_path, monkeypatch
-):
-    """An omitted field means "leave it alone" — for all four, not just some.
-
-    Preserving status and notes but not score/recommendation made a bare
-    re-save of a reposted listing destroy the stored analysis, which also
-    dropped the job out of every min_score query.
-    """
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
-
-    url = "https://example.com/job/analysis"
-    save_job_analysis(
-        url=url,
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=85,
-        recommendation="APPLY",
-    )
-    set_application_status(url=url, status="interviewing", notes="phone screen 6/12")
-
-    save_job_analysis(
-        url=url, title="Engineer (reposted)", company="Acme", visa_verdict="GREEN"
-    )
-
-    record = _read_jobs().jobs[0]
-    assert record.score == 85
-    assert record.recommendation == "APPLY"
-    assert record.status == "interviewing"
-    assert record.notes == "phone screen 6/12"
-
-
-def test_save_job_analysis_explicit_score_overwrites(tmp_path, monkeypatch):
-    """A fresh analysis still replaces the old score."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-
-    url = "https://example.com/job/rescore"
-    save_job_analysis(
-        url=url,
-        title="E",
-        company="C",
-        visa_verdict="GREEN",
-        score=85,
-        recommendation="APPLY",
-    )
-    save_job_analysis(
-        url=url,
-        title="E",
-        company="C",
-        visa_verdict="GREEN",
-        score=40,
-        recommendation="SKIP",
-    )
-
-    record = _read_jobs().jobs[0]
-    assert record.score == 40
-    assert record.recommendation == "SKIP"
-
-
-def test_read_jobs_refuses_a_store_from_a_newer_schema(tmp_path):
-    """A store written by a newer version must not be silently downgraded.
-
-    Treating any version mismatch as "legacy" re-stamped a v3 file as v2 and
-    let pydantic drop the fields it did not know about, so the next write
-    persisted the lossy version.
-    """
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    payload = {
-        "schema_version": 999,
-        "jobs": [_legacy_job_dict(applied=True)],
-    }
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="(?i)newer"):
-        _read_jobs(path=jobs_path)
-
-    # and the file on disk is untouched
-    assert json.loads(jobs_path.read_text(encoding="utf-8"))["schema_version"] == 999
-
-
-def test_save_job_analysis_upsert_preserves_notes(tmp_path, monkeypatch):
-    """Re-analyzing a reposted listing must not wipe application-tracking notes."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
-
-    url = "https://example.com/job/notes"
-    save_job_analysis(
-        url=url, title="Engineer", company="Acme", visa_verdict="GREEN", score=70
-    )
-    set_application_status(url=url, status="interviewing", notes="phone screen 6/12")
-
-    save_job_analysis(
-        url=url, title="Engineer (reposted)", company="Acme", visa_verdict="GREEN"
-    )
-
-    record = _read_jobs().jobs[0]
-    assert record.notes == "phone screen 6/12"
-    assert record.status == "interviewing"
-
-
-def test_save_job_analysis_explicit_notes_overwrite_existing(tmp_path, monkeypatch):
-    """An explicit notes argument still wins over the preserved value."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
-
-    url = "https://example.com/job/notes2"
-    save_job_analysis(url=url, title="Engineer", company="Acme", visa_verdict="GREEN")
-    set_application_status(url=url, status="applied", notes="old note")
-
-    save_job_analysis(
-        url=url,
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        notes="new note",
-    )
-
-    assert _read_jobs().jobs[0].notes == "new note"
-
-
-def test_tools_return_error_envelope_when_store_unreadable(tmp_path, monkeypatch):
-    """An OSError on read must not escape to the MCP boundary as a traceback.
-
-    _read_jobs calls read_text(), which raises IsADirectoryError/PermissionError
-    when the store path is not a readable file. Callers only catch ValueError,
-    so the OSError has to be wrapped rather than propagated.
-    """
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    jobs_path.mkdir()  # a directory where a file is expected
-    from tools.jobs_store import save_job_analysis, list_jobs, set_application_status
-
-    listed = list_jobs()
-    assert listed.success is False
-    assert "unreadable" in listed.error_message
-
-    status_set = set_application_status(url="https://example.com/x", status="applied")
-    assert status_set.success is False
+def test_sc14_jd_text_omitted_on_save_leaves_get_job_description_none(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
 
     saved = save_job_analysis(
-        url="https://example.com/x", title="T", company="C", visa_verdict="GREEN"
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
     )
-    assert saved.success is False
 
-
-def test_save_job_analysis_upsert_preserves_applied(tmp_path, monkeypatch):
-    """FIX-3: upsert after set_application_status must NOT reset status=not_applied
-    (data loss bug)."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, set_application_status, _read_jobs
-
-    save_job_analysis(
-        url="https://example.com/job/applied",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=70,
-    )
-    set_application_status(url="https://example.com/job/applied", status="applied")
-
-    # Re-analyze same job — status must NOT be reset
-    result = save_job_analysis(
-        url="https://example.com/job/applied",
-        title="Engineer",
-        company="Acme",
-        visa_verdict="GREEN",
-        score=90,
-    )
+    result = get_job(id=saved.id, include_description=True)
 
     assert result.success is True
-    assert result.updated is True
-
-    store = _read_jobs(path=jobs_path)
-    assert len(store.jobs) == 1
-    assert store.jobs[0].status == "applied"  # preserved — not reset to not_applied
-    assert store.jobs[0].score == 90  # new analysis data is stored
+    assert result.description is None
+    assert result.has_description is False
 
 
-# ---------------------------------------------------------------------------
-# FIX 4: guard non-positive limit
-# ---------------------------------------------------------------------------
+def test_sc16_get_job_is_the_only_path_that_returns_jd_text(db_path):
+    """SC-15/SC-16 pairing: list_jobs excludes it (proven elsewhere), get_job
+    is the sole read path — and only when include_description=True."""
+    from tools.jobs_store import save_job_analysis, get_job
 
-
-def test_list_jobs_limit_zero_returns_error(tmp_path, monkeypatch):
-    """FIX-4a: limit=0 → success=False."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs
-
-    result = list_jobs(limit=0)
-
-    assert result.success is False
-    assert result.error_message is not None
-    assert (
-        "positive" in result.error_message.lower()
-        or "limit" in result.error_message.lower()
-    )
-
-
-def test_list_jobs_limit_negative_returns_error(tmp_path, monkeypatch):
-    """FIX-4b: limit=-1 → success=False (not N-1 silent wrong result)."""
-    _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs
-
-    result = list_jobs(limit=-1)
-
-    assert result.success is False
-    assert result.error_message is not None
-
-
-# ---------------------------------------------------------------------------
-# FIX 6: strengthen analyzed_at freshness assertion
-# ---------------------------------------------------------------------------
-
-
-def test_save_job_analysis_server_stamps_analyzed_at_freshness(tmp_path, monkeypatch):
-    """FIX-6: analyzed_at is not only parseable but is within 5 seconds of now (timezone-aware)."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import save_job_analysis, _read_jobs
-    from datetime import datetime, timezone
-
-    save_job_analysis(
-        url="https://example.com/freshness",
-        title="Engineer",
+    saved = save_job_analysis(
+        url="https://ex.com/1",
+        title="SWE",
         company="Acme",
-        visa_verdict="GREEN",
+        country="USA",
+        jd_text="a" * 5000,
     )
 
-    store = _read_jobs(path=jobs_path)
-    analyzed_at = store.jobs[0].analyzed_at
-    parsed = datetime.fromisoformat(analyzed_at)
-    # Ensure aware datetime for subtraction (server stamps with +00:00)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    default_call = get_job(id=saved.id)
+    assert default_call.description is None  # include_description defaults False
+    assert default_call.has_description is True  # but the affordance is visible
 
-    assert abs((parsed - datetime.now(timezone.utc)).total_seconds()) < 5
+    explicit_call = get_job(id=saved.id, include_description=True)
+    assert explicit_call.description == "a" * 5000
 
 
-# ---------------------------------------------------------------------------
-# T-11: legacy schema migration / coercion (SC-25..SC-29)
-# ---------------------------------------------------------------------------
+def test_get_job_by_url(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
 
-
-def _legacy_job_dict(**overrides) -> dict:
-    """Raw dict shaped like a pre-migration (schema_version 1) job record.
-
-    Carries the old `applied: bool` field and omits `schema_version` /
-    `status` entirely, mirroring a jobs.json written before this migration.
-    """
-    base = {
-        "url": "https://example.com/job/1",
-        "title": "Software Engineer",
-        "company": "Acme Corp",
-        "visa_verdict": "GREEN",
-        "analyzed_at": "2025-06-01T00:00:00+00:00",
-        "applied": False,
-        "score": None,
-        "recommendation": None,
-        "notes": None,
-    }
-    base.update(overrides)
-    return base
-
-
-def test_read_jobs_legacy_applied_true_coerces_to_status_applied(tmp_path):
-    """SC-25: legacy file (no schema_version, applied=True) coerces to status='applied'."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    payload = {"jobs": [_legacy_job_dict(applied=True)]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-
-    assert len(result.jobs) == 1
-    assert result.jobs[0].status == "applied"
-
-
-def test_read_jobs_legacy_applied_false_coerces_to_status_not_applied(tmp_path):
-    """SC-26: legacy file (no schema_version, applied=False) coerces to status='not_applied'."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    payload = {"jobs": [_legacy_job_dict(applied=False)]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-
-    assert len(result.jobs) == 1
-    assert result.jobs[0].status == "not_applied"
-
-
-def test_read_jobs_v2_stamped_file_still_coerces_a_legacy_record(tmp_path):
-    """Regression: a version-2 stamp must not skip a record that still has `applied`.
-
-    Hand-edited or externally-written stores can carry the current version stamp
-    with a stale record inside. Gating coercion on the top-level version let
-    pydantic drop `applied: true` as an unknown field and default the record to
-    not_applied — silent data loss on the migration path.
-    """
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    payload = {"schema_version": 2, "jobs": [_legacy_job_dict(applied=True)]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-
-    assert len(result.jobs) == 1
-    assert result.jobs[0].status == "applied"
-
-
-def test_read_jobs_non_dict_payload_reports_corrupt(tmp_path):
-    """A JSON array/scalar at the top level is corrupt, not a crash."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    jobs_path.write_text(json.dumps([{"url": "https://a.com"}]), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="corrupt"):
-        _read_jobs(path=jobs_path)
-
-
-def test_read_jobs_non_dict_job_record_reports_corrupt(tmp_path):
-    """A non-object inside `jobs` is corrupt rather than silently skipped."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    jobs_path.write_text(json.dumps({"jobs": ["not-a-record"]}), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="corrupt"):
-        _read_jobs(path=jobs_path)
-
-
-def test_read_jobs_migrated_file_skips_coercion(tmp_path):
-    """SC-27: a schema_version=2 file with `status` already set is used verbatim."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    job = _legacy_job_dict()
-    del job["applied"]
-    job["status"] = "interviewing"
-    payload = {"schema_version": 2, "jobs": [job]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-
-    assert len(result.jobs) == 1
-    assert result.jobs[0].status == "interviewing"
-
-
-def test_read_jobs_legacy_coercion_is_in_memory_only(tmp_path, monkeypatch):
-    """SC-28: coercion never rewrites the file — only the next real write persists it."""
-    from tools.jobs_store import _read_jobs, save_job_analysis
-
-    jobs_path = tmp_path / "jobs.json"
-    original_payload = {
-        "jobs": [_legacy_job_dict(url="https://example.com/job/1", applied=True)]
-    }
-    original_text = json.dumps(original_payload)
-    jobs_path.write_text(original_text, encoding="utf-8")
-
-    result = _read_jobs(path=jobs_path)
-    assert result.jobs[0].status == "applied"
-    # Read-only: disk content is untouched by coercion.
-    assert jobs_path.read_text(encoding="utf-8") == original_text
-
-    _patch_jobs_path(monkeypatch, tmp_path)
-    save_job_analysis(
-        url="https://example.com/job/1",
-        title="Software Engineer",
-        company="Acme Corp",
-        visa_verdict="GREEN",
+    saved = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
     )
 
-    raw = json.loads(jobs_path.read_text(encoding="utf-8"))
-    assert raw.get("schema_version") == 2
-    assert "status" in raw["jobs"][0]
-    assert "applied" not in raw["jobs"][0]
-
-
-def test_read_jobs_invalid_status_value_still_raises_corrupt(tmp_path):
-    """SC-29: an uncoercible record (invalid status) still errors — no silent repair."""
-    from tools.jobs_store import _read_jobs
-
-    jobs_path = tmp_path / "jobs.json"
-    job = _legacy_job_dict()
-    del job["applied"]
-    job["status"] = "bogus_status"
-    payload = {"schema_version": 2, "jobs": [job]}
-    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="(?i)corrupt"):
-        _read_jobs(path=jobs_path)
-
-
-# ---------------------------------------------------------------------------
-# FIX 7: combined FILTER → SORT → LIMIT pipeline test
-# ---------------------------------------------------------------------------
-
-
-def test_list_jobs_combined_filter_sort_limit(tmp_path, monkeypatch):
-    """FIX-7: FILTER(since+min_score) → SORT(score desc) → LIMIT(2) produces exact expected order."""
-    jobs_path = _patch_jobs_path(monkeypatch, tmp_path)
-    from tools.jobs_store import list_jobs, _write_jobs, JobStore, StoredJob
-
-    # Jobs: varying analyzed_at, status, score
-    job_old_low = StoredJob(
-        **_make_job(
-            url="https://old-low.com",
-            analyzed_at="2024-01-01T00:00:00+00:00",
-            score=40,
-            status="not_applied",
-        )
-    )
-    job_new_low = StoredJob(
-        **_make_job(
-            url="https://new-low.com",
-            analyzed_at="2025-06-01T00:00:00+00:00",
-            score=50,
-            status="not_applied",
-        )
-    )
-    job_new_high_a = StoredJob(
-        **_make_job(
-            url="https://new-high-a.com",
-            analyzed_at="2025-06-02T00:00:00+00:00",
-            score=85,
-            status="not_applied",
-        )
-    )
-    job_new_high_b = StoredJob(
-        **_make_job(
-            url="https://new-high-b.com",
-            analyzed_at="2025-06-03T00:00:00+00:00",
-            score=95,
-            status="applied",
-        )
-    )
-    _write_jobs(
-        JobStore(jobs=[job_old_low, job_new_low, job_new_high_a, job_new_high_b]),
-        path=jobs_path,
-    )
-
-    # since filters out job_old_low (2024); min_score=60 filters out job_new_low (50)
-    # Remaining: new_high_a (85), new_high_b (95)
-    # sort_by='score' desc: new_high_b (95), new_high_a (85)
-    # limit=2 → both
-    result = list_jobs(
-        since="2025-01-01T00:00:00Z", min_score=60, sort_by="score", limit=2
-    )
+    result = get_job(url="https://ex.com/1")
 
     assert result.success is True
-    assert result.count == 2
-    assert result.jobs[0].url == "https://new-high-b.com"  # score=95 first
-    assert result.jobs[1].url == "https://new-high-a.com"  # score=85 second
+    assert result.job.id == saved.id
+
+
+def test_get_job_neither_id_nor_url_is_invalid_input(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job()
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_both_id_and_url_is_invalid_input(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(id=saved.id, url="https://ex.com/1")
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_returns_linked_resume_version_summaries(db_path):
+    """D6: the linked resume summaries ARE the headline query — 'did I apply
+    to X?' -> 'yes, and with this resume.' Summaries, not content."""
+    from tools.jobs_store import save_job_analysis, get_job
+    from tools.resumes import save_resume_version
+
+    job = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+    version = save_resume_version(
+        content="tailored text",
+        label="Tailored for Acme",
+        parent_id=None,
+        job_id=job.id,
+    )
+
+    result = get_job(id=job.id)
+
+    assert result.success is True
+    assert len(result.resume_versions) == 1
+    assert result.resume_versions[0].id == version.id
+    assert result.resume_versions[0].label == "Tailored for Acme"
+    # summary, not the full text
+    assert not hasattr(result.resume_versions[0], "content")
+
+
+def test_sc22_full_cross_conversation_recall_via_get_job(db_path):
+    """SC-22: completes the round-trip from the PR2 partial test — this time
+    through get_job rather than list_resume_versions alone."""
+    from tools.jobs_store import save_job_analysis, set_application_status, get_job
+    from tools.resumes import save_resume_version, get_resume_version
+
+    job = save_job_analysis(
+        url="https://example.com/datadog", title="SWE", company="Datadog", country="US"
+    )
+    set_application_status(id=job.id, status="interviewing")
+    version = save_resume_version(
+        content="Datadog-tailored resume text",
+        label="Datadog — infra focus",
+        parent_id=None,
+        job_id=job.id,
+    )
+
+    found = get_job(id=job.id)
+
+    assert found.success is True
+    assert found.job.status == "interviewing"
+    assert len(found.resume_versions) == 1
+    assert found.resume_versions[0].id == version.id
+    assert found.resume_versions[0].label == "Datadog — infra focus"
+
+    fetched = get_resume_version(id=version.id)
+    assert fetched.version.content == "Datadog-tailored resume text"
 
 
 @pytest.mark.contract
-def test_stored_job_rejects_unknown_fields(tmp_path):
-    """A stale kwarg must fail loudly instead of being dropped.
+def test_get_job_result_has_no_visa_field_and_has_description_always_present():
+    from tools.jobs_store import GetJobResult
 
-    Pydantic ignores unknown fields by default. During the applied->status
-    rename that turned a stale `applied=True` into a silent no-op, which
-    surfaced much later as a baffling wrong-value assertion rather than an
-    immediate error at the call site.
-    """
-    from pydantic import ValidationError
-    from tools.jobs_store import StoredJob
-
-    with pytest.raises(ValidationError):
-        StoredJob(**_make_job(), applied=True)
+    result = GetJobResult(success=True)
+    assert "has_description" in GetJobResult.model_fields
+    assert result.has_description is False  # always-present, defaults False
+    assert "visa" not in GetJobResult.model_fields
 
 
-def test_read_jobs_rejects_a_record_with_unknown_fields(tmp_path):
-    """An unrecognised field in a stored record is corrupt, not ignorable.
+# ---------------------------------------------------------------------------
+# get_job's custom_title lookup (findings 1/2) — a job saved without a url
+# is findable ONLY by custom_title; without this, that promise had no
+# retrieval path.
+# ---------------------------------------------------------------------------
 
-    Silently dropping it is how the migration path lost data before: the
-    record round-trips through the next write without the field, and nothing
-    ever said so.
-    """
-    from tools.jobs_store import _read_jobs
 
-    jobs_path = tmp_path / "jobs.json"
-    record = _make_job()
-    record["salary_band"] = "120-150k"
-    jobs_path.write_text(
-        json.dumps({"schema_version": 2, "jobs": [record]}), encoding="utf-8"
+def test_get_job_by_custom_title_single_match(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        custom_title="Acme referral", title="SWE", company="Acme", country="USA"
     )
 
-    with pytest.raises(ValueError, match="(?i)corrupt"):
-        _read_jobs(path=jobs_path)
+    result = get_job(custom_title="Acme referral")
+
+    assert result.success is True
+    assert result.job.id == saved.id
 
 
-def test_read_jobs_still_migrates_a_clean_legacy_file(tmp_path):
-    """extra=forbid must not break the legacy path: `applied` is popped first."""
-    from tools.jobs_store import _read_jobs
+def test_get_job_by_custom_title_no_match_is_not_found(db_path):
+    from tools.jobs_store import get_job
 
-    jobs_path = tmp_path / "jobs.json"
-    jobs_path.write_text(
-        json.dumps({"jobs": [_legacy_job_dict(applied=True)]}), encoding="utf-8"
+    result = get_job(custom_title="Nonexistent")
+
+    assert result.success is False
+    assert result.error == "not_found"
+
+
+def test_get_job_by_custom_title_ambiguous_when_multiple_jobs_share_it(db_path):
+    """custom_title is NOT unique (R3/SC-08) — a lookup matching more than
+    one job must say so explicitly, not silently return the first."""
+    from tools.jobs_store import save_job_analysis, get_job
+
+    j1 = save_job_analysis(
+        custom_title="Acme referral", title="SWE 1", company="Acme", country="USA"
+    )
+    j2 = save_job_analysis(
+        custom_title="Acme referral", title="SWE 2", company="Acme", country="USA"
     )
 
-    result = _read_jobs(path=jobs_path)
+    result = get_job(custom_title="Acme referral")
 
-    assert result.jobs[0].status == "applied"
+    assert result.success is False
+    assert result.error == "ambiguous"
+    assert j1.id in result.message
+    assert j2.id in result.message
+
+
+def test_get_job_neither_id_url_nor_custom_title_is_invalid_input(db_path):
+    from tools.jobs_store import get_job
+
+    result = get_job()
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+def test_get_job_id_and_custom_title_together_is_invalid_input(db_path):
+    from tools.jobs_store import save_job_analysis, get_job
+
+    saved = save_job_analysis(
+        custom_title="Acme referral", title="SWE", company="Acme", country="USA"
+    )
+
+    result = get_job(id=saved.id, custom_title="Acme referral")
+
+    assert result.success is False
+    assert result.error == "invalid_input"
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: get_job's linked-resume-summaries query must not be `SELECT *`
+# — that would pull every version's full `content` even on the default
+# include_description=False path, to build a summary that discards it.
+# ---------------------------------------------------------------------------
+
+
+def test_get_job_resume_summaries_query_is_column_scoped_not_select_star(
+    db_path, monkeypatch
+):
+    """sqlite3.Connection is a C-extension type and cannot be monkeypatched
+    directly (its methods are read-only), so this spies via a thin proxy
+    wrapped around the real connection `get_job` actually uses."""
+    from contextlib import contextmanager
+
+    import tools.jobs_store as jobs_store_mod
+    from tools.jobs_store import save_job_analysis, get_job
+    from tools.resumes import save_resume_version
+
+    job = save_job_analysis(
+        url="https://ex.com/1", title="SWE", company="Acme", country="USA"
+    )
+    save_resume_version(
+        content="x" * 10_000, label="Tailored", parent_id=None, job_id=job.id
+    )
+
+    executed_sql: list[str] = []
+
+    class _SpyConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            executed_sql.append(sql)
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    original_connect = jobs_store_mod.connect
+
+    @contextmanager
+    def _spy_connect(*args, **kwargs):
+        with original_connect(*args, **kwargs) as conn:
+            yield _SpyConn(conn)
+
+    monkeypatch.setattr(jobs_store_mod, "connect", _spy_connect)
+
+    get_job(id=job.id)
+
+    resume_query = next(
+        sql for sql in executed_sql if "resume_versions" in sql and "job_id = ?" in sql
+    )
+    assert "SELECT *" not in resume_query

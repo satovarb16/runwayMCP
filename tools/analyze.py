@@ -1,22 +1,90 @@
 """Orchestrator tool: analyze_job.
 
-Combines fetch_job_posting → check_visa_sponsorship → general resume load
-into a single envelope, then hands the data to the conversation-side Claude
-to score and recommend. The server performs NO LLM reasoning (no MCP
-sampling): it gathers the facts (job, visa history, the candidate's general
-resume text) and the scoring rubric, and Claude produces the match score and
-APPLY/CONSIDER/SKIP verdict from them.
+FINAL 0.3.0 contract (sqlite-memory-and-pasted-jd, design D5). Claude reads
+the job description pasted into the conversation, extracts `title`,
+`company`, `country` (plus optional `url`/`custom_title`), and passes those
+— the raw JD text is NEVER a parameter of this tool. The text is already in
+Claude's context; accepting it here would make it travel a second time as
+call payload, for text the server cannot use (every parser that provided a
+floor of truth is deleted). The text reaches the server exactly once, at
+save_job_analysis, and only for jobs the user decides to keep.
 
-Adds zero new external dependencies — all I/O is delegated to the sub-tools.
+Two consequences accepted at the design-decision level (obs #368): there is
+NO server-side validation of Claude's extraction — a wrong company or
+country is not detected here; and a job analyzed but never saved leaves no
+trace of its text. The envelope's `extracted` echo is the only mitigation:
+it does not detect a bad extraction, it makes one VISIBLE to the only party
+who can catch it.
+
+`analyze_job` is `def`, not `async def`: it has zero awaits, and its only
+I/O (SQLite reads) is blocking — an async tool runs on FastMCP's event loop
+and would block it on every store read; sync tools run on the worker pool,
+where every other store tool already runs.
+
+Guard 1 (anti-self-scoring, SC-21) resolution, carried forward from PR2's
+tasks 2.5l/2.5n and now adapted to `url` being OPTIONAL (task 3a.2j): when
+`url` is given, it is resolved to a `job_id` via an exact lookup against the
+`jobs` table before calling the job_id-keyed `_general_resume`. When `url`
+is absent but `custom_title` is given, the SAME resolution happens against
+`custom_title` instead — a job saved without a `url` (the referral case
+`_NO_URL_NOTICE` exists for) is still resolvable, so the guard stays armed
+on that path too; a naive "no url -> job_id=None always" reading of an
+earlier revision of this docstring was WRONG for exactly this case: it
+would silently hand back a job's own tailored resume when that job is
+re-analyzed by custom_title alone, the precise self-scoring inflation this
+guard exists to prevent. `job_id` is None only when neither `url` nor
+`custom_title` is given, or the one given matches no saved job — never a
+blanket bypass. `custom_title` is NOT unique (see jobs_store.py's
+`_find_job_ids_by_custom_title`); when it resolves to more than one job,
+this tool refuses to guess and returns `error="ambiguous_custom_title"`
+rather than silently picking one (which could arm the guard for the wrong
+job, or fail to arm it for the right one).
+
+Guard 2 (no_resume vs corrupt) is preserved by wrapping the url/custom_title
+-> job_id resolution and the _general_resume call in a single try/except
+ValueError block: a corrupt or unreadable database raises from any of those
+calls and is reported as "corrupt"; "no_resume" is reported only when the
+database is readable but nothing usable was found.
+
+Work authorization (design D7, task 3b.1m) is Step 2, inserted between the
+resume precondition (Step 1, unchanged) and envelope-build (now Step 3):
+`_declared_authorizations()` returns None only when set_work_authorization
+has NEVER been called (never a default — defaulting to any country, e.g.
+the US, would mis-warn everyone outside it), producing
+error="no_work_authorization". A database corrupt enough to break THIS
+read is reported as "corrupt", never "no_work_authorization" — the same
+Guard-2-style distinction Step 1 already makes for the resume precondition,
+extended to this one. The comparison itself
+(`tools.work_auth._check_work_authorization`) is LIVE: computed fresh on
+every call against the CURRENT declared set, never persisted — a stored
+verdict would go stale the moment the user's authorization changes, exactly
+the mistake the deleted `visa_verdict` made.
+
+Precondition ordering, decided deliberately (not incidentally): resume
+FIRST, work-authorization SECOND. A first-time user with neither saved
+loses only the resume message on this call and gets the work-authorization
+message on the very next one — one extra round trip, not "many". Reversing
+the order was rejected because `test_sc38_empty_store_no_resume_error`
+(PR3a, pinned) already asserts "no_resume" wins when both preconditions are
+unset — an already-shipped guard this chain's "never weaken a safety test"
+rule forbids relitigating by changing behavior out from under it.
+
+Adds zero new external dependencies — the resume lookup is delegated to
+tools/resumes.py and tools/jobs_store.py; the work-authorization lookup and
+comparison to tools/work_auth.py.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
-from tools.jobs import fetch_job_posting, JobPostingResult
-from tools.visa import check_visa_sponsorship, VisaResult
-from tools.resumes import _read_resumes, _general_resume, ResumeVersion
+from tools.jobs_store import _find_job_id_by_url, _find_job_ids_by_custom_title
+from tools.resumes import _general_resume, ResumeVersion
+from tools.work_auth import (
+    _check_work_authorization,
+    _declared_authorizations,
+    WorkAuthorizationCheck,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -24,41 +92,43 @@ from tools.resumes import _read_resumes, _general_resume, ResumeVersion
 # ---------------------------------------------------------------------------
 
 _RECOMMENDATION_RULES: list[str] = [
-    "SKIP if the visa verdict is RED or the match score is below 40 "
-    "(SKIP takes precedence over APPLY).",
-    "APPLY if the visa verdict is GREEN and the match score is 70 or higher.",
-    "CONSIDER in every other case (including UNKNOWN or YELLOW visa verdicts).",
+    "SKIP if the match score is below 40.",
+    "APPLY if the match score is 70 or higher.",
+    "CONSIDER in every other case.",
 ]
 
 _SCORING_INSTRUCTIONS: str = (
-    "Using the job posting, the candidate's general resume text, and the visa "
-    "verdict above, produce: (1) a technical-fit match score from 0 to 100 "
-    "based on skills, experience, and education; (2) matched_skills and "
-    "missing_skills lists; (3) a short, factual summary of the fit; and (4) a "
-    "recommendation of APPLY, CONSIDER, or SKIP by applying the "
-    "recommendation_rules in order. Be factual and objective — do not "
-    "inflate the score. If you recommend APPLY or CONSIDER, tailor the "
-    "resume text for this job and save it with save_resume_version "
-    "(parent_id=this resume's id, job_url=this job's url)."
+    "The job posting is NOT part of this envelope — the server no longer "
+    "fetches it. Score against the posting text present in the conversation; "
+    "if you do not have it, ask the user to paste it rather than working from "
+    "the URL alone. "
+    "Using that posting and the candidate's general resume text, produce: "
+    "(1) a technical-fit match score from 0 to 100 based on skills, "
+    "experience, and education; (2) matched_skills and missing_skills lists; "
+    "(3) a short, factual summary of the fit; and (4) a recommendation of "
+    "APPLY, CONSIDER, or SKIP by applying the recommendation_rules in order. "
+    "Be factual and objective — do not inflate the score. If you recommend "
+    "APPLY or CONSIDER, tailor the resume text for this job and save it with "
+    "save_resume_version (parent_id=this resume's id, job_id=the id returned "
+    "by save_job_analysis). save_job_analysis must be called FIRST so the "
+    "job row exists — save_resume_version's job_id is a foreign key and "
+    "rejects an id that does not yet exist."
 )
+
+_NO_URL_NOTICE: str = (
+    "No url was given for this job. Agree a memorable custom_title with the "
+    "user now and tell them it is how they will find this record again "
+    "later — pass it to save_job_analysis as custom_title."
+)
+# Shown only when NEITHER url NOR custom_title is present — a caller who
+# already supplied custom_title has already agreed a handle; repeating the
+# notice would send them through a redundant round-trip over one already in
+# hand (finding 4).
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
-
-class JobSummary(BaseModel):
-    title: str
-    company: str
-    url: str
-
-
-class VisaSummary(BaseModel):
-    verdict: str  # "GREEN" | "YELLOW" | "RED" | "UNKNOWN"
-    filings: int
-    approval_rate: float
-    error: str | None = None
 
 
 class ScoringGuide(BaseModel):
@@ -68,19 +138,40 @@ class ScoringGuide(BaseModel):
     recommendation_rules: list[str]
 
 
+class ExtractedFields(BaseModel):
+    """Verbatim echo of analyze_job's Claude-extracted input (design D5).
+
+    Every parser that provided a floor of truth on these fields is deleted;
+    this echo is the ONLY visibility the user gets into a bad extraction. No
+    normalization or reformatting is applied here — that would defeat the
+    purpose of showing exactly what was received.
+    """
+
+    title: str
+    company: str
+    country: str
+    url: str | None = None
+    custom_title: str | None = None
+
+
 class AnalyzeJobResult(BaseModel):
     """Decision-ready envelope of FACTS. Claude derives the score and verdict.
 
-    On success, job/visa/resume/scoring_guide are populated. The server does
-    not compute a match score or recommendation — those are left to Claude,
-    which reasons over this envelope and the scoring_guide.
+    On success, extracted/resume/scoring_guide are populated. The server
+    does not compute a match score or recommendation — those are left to
+    Claude, which reasons over this envelope and the scoring_guide.
+
+    No `job` or `visa` field — both the deleted job-fetch and visa-check
+    steps are gone from this orchestrator entirely.
     """
 
-    job: JobSummary | None = None
-    visa: VisaSummary | None = None
+    extracted: ExtractedFields | None = None
     resume: ResumeVersion | None = None
     scoring_guide: ScoringGuide | None = None
-    # top-level error code: no_resume | corrupt | fetch_failed
+    work_authorization: WorkAuthorizationCheck | None = None
+    notice: str | None = None  # e.g. "no url given, agree a custom_title"
+    # top-level error code: no_resume | corrupt | ambiguous_custom_title
+    # | no_work_authorization
     error: str | None = None
     message: str | None = None  # human-readable explanation for top-level errors
 
@@ -88,21 +179,6 @@ class AnalyzeJobResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _map_visa(visa_result: VisaResult, error: str | None = None) -> VisaSummary:
-    """Map a VisaResult to a VisaSummary for the envelope.
-
-    - verdict is uppercased (Verdict enum value → uppercase string)
-    - filings ← total_filings
-    - approval_rate passes through directly (no 'confidence' field)
-    """
-    return VisaSummary(
-        verdict=visa_result.verdict.value.upper(),
-        filings=visa_result.total_filings,
-        approval_rate=visa_result.approval_rate,
-        error=error,
-    )
 
 
 def _scoring_guide() -> ScoringGuide:
@@ -118,41 +194,85 @@ def _scoring_guide() -> ScoringGuide:
 # ---------------------------------------------------------------------------
 
 
-async def analyze_job(url: str) -> AnalyzeJobResult:
-    """Gather job + visa + resume for a posting so Claude can score the match.
+def analyze_job(
+    title: str,
+    company: str,
+    country: str,
+    url: str | None = None,
+    custom_title: str | None = None,
+) -> AnalyzeJobResult:
+    """Gather the general resume + scoring guide so Claude can score the match.
 
-    Performs the data-gathering half of a job analysis in one call:
-    1. Verifies a general resume exists (returns error envelope if not) —
-       checked BEFORE any fetch so a request that cannot be scored anyway
-       never pays for a network call.
-    2. Fetches the job posting from the given URL.
-    3. Checks H-1B visa sponsorship history for the company.
-    4. Returns the job, visa verdict, the general resume, and a scoring guide.
+    1. Verifies a general resume exists (returns error envelope if not).
+    2. Verifies work authorization has been declared at least once (returns
+       error="no_work_authorization" if not — see design D7/module docstring
+       for the precondition ordering decision).
+    3. Returns the general resume, a scoring guide, an `extracted` echo of
+       the caller's input, and a live work-authorization comparison.
 
     The match score and APPLY/CONSIDER/SKIP recommendation are NOT computed by
     this tool — after calling it, score the candidate's resume against the job
-    and apply the scoring_guide's recommendation_rules in your reply.
+    (already pasted into this conversation) and apply the scoring_guide's
+    recommendation_rules in your reply.
 
     The resume injected here is the GENERAL resume (design D6), not the most
     recently tailored one: scoring a job against a resume already tailored
     FOR that job would inflate the match score by scoring the resume against
     itself.
 
-    This tool NEVER raises — all failures are encoded in the return envelope.
+    This tool NEVER raises for any documented failure mode — all such
+    failures are encoded in the return envelope. An unexpected keyword
+    argument (e.g. a JD text payload) is a caller programming error and
+    raises normally, exactly as calling any Python function with an unknown
+    keyword does.
 
     Args:
-        url: The raw job posting URL to analyze.
+        title:        Job title, Claude-extracted from the pasted posting.
+        company:      Company name, Claude-extracted.
+        country:      Free-text country, Claude-extracted. Compared against
+                      the user's declared work authorization; a mismatch
+                      populates work_authorization with an advisory warning.
+        url:          The job posting URL, if any. Resolved to a job_id
+                      (exact match against the jobs table) so the
+                      general-resume selection can exclude a resume already
+                      tailored to this job. None when the user has no URL to
+                      give (e.g. a referral).
+        custom_title: The user's handle for a URL-less job. Echoed back, AND
+                      — when `url` is absent — resolved to a job_id the same
+                      way `url` is, so Guard 1 (anti-self-scoring) stays
+                      armed for jobs saved without a url. If more than one
+                      saved job shares this custom_title, this tool refuses
+                      to guess and returns error="ambiguous_custom_title".
 
     Returns:
-        AnalyzeJobResult with job, visa, resume, and scoring_guide populated
-        on success, or error/message fields populated on failure.
+        AnalyzeJobResult with extracted/resume/scoring_guide/
+        work_authorization populated on success, or error/message fields
+        populated on failure ("no_resume" | "corrupt" |
+        "ambiguous_custom_title" | "no_work_authorization").
     """
-    # --- Step 1: Resume precondition (BEFORE any fetch) ---
+    # --- Step 1: Resolve job_id (Guard 1), then the resume precondition ---
     try:
-        store = _read_resumes()
-        resume = _general_resume(store, for_job_url=url)
+        if url is not None:
+            job_id = _find_job_id_by_url(url)
+        elif custom_title is not None:
+            matching_ids = _find_job_ids_by_custom_title(custom_title)
+            if len(matching_ids) > 1:
+                return AnalyzeJobResult(
+                    error="ambiguous_custom_title",
+                    message=(
+                        f"{len(matching_ids)} saved jobs share custom_title "
+                        f"{custom_title!r} (ids: {matching_ids}). Re-analyze "
+                        f"with 'url' instead, or use get_job with a specific "
+                        f"'id' to confirm which job this is before "
+                        f"proceeding."
+                    ),
+                )
+            job_id = matching_ids[0] if matching_ids else None
+        else:
+            job_id = None
+        resume = _general_resume(job_id=job_id)
     except ValueError as exc:
-        # NOT no_resume: the store exists and is unreadable or malformed.
+        # NOT no_resume: the database exists and is unreadable or malformed.
         # Telling the user to run save_resume_version here sends them to a
         # tool that will fail the same way, on the same file.
         return AnalyzeJobResult(error="corrupt", message=str(exc))
@@ -162,38 +282,35 @@ async def analyze_job(url: str) -> AnalyzeJobResult:
             message="No resume found. Run save_resume_version first.",
         )
 
-    # --- Step 2: Fetch job posting ---
+    # --- Step 2: Work-authorization precondition (design D7, task 3b.1m) ---
     try:
-        job_result: JobPostingResult = fetch_job_posting(url)
-    except Exception as exc:
+        declared = _declared_authorizations()
+    except ValueError as exc:
+        # NOT no_work_authorization: the database exists and is unreadable
+        # or malformed. Telling the user to call set_work_authorization here
+        # sends them to a tool that will fail the same way, on the same file.
+        return AnalyzeJobResult(error="corrupt", message=str(exc))
+    if declared is None:
         return AnalyzeJobResult(
-            error="fetch_failed",
-            message=str(exc),
+            error="no_work_authorization",
+            message=(
+                "No work authorization declared yet. Call "
+                "set_work_authorization with the countries you may legally "
+                "work in before analyzing a job."
+            ),
         )
 
-    job_summary = JobSummary(
-        title=job_result.title,
-        company=job_result.company,
-        url=job_result.source_url or url,
-    )
-
-    # --- Step 3: Visa check (failure → UNKNOWN, orchestration CONTINUES) ---
-    visa_summary: VisaSummary
-    try:
-        visa_result: VisaResult = check_visa_sponsorship(job_result.company)
-        visa_summary = _map_visa(visa_result)
-    except Exception as exc:
-        visa_summary = VisaSummary(
-            verdict="UNKNOWN",
-            filings=0,
-            approval_rate=0.0,
-            error=str(exc),
-        )
-
-    # --- Step 4: Hand facts + rubric to Claude for scoring ---
+    # --- Step 3: Hand facts + rubric to Claude for scoring ---
     return AnalyzeJobResult(
-        job=job_summary,
-        visa=visa_summary,
+        extracted=ExtractedFields(
+            title=title,
+            company=company,
+            country=country,
+            url=url,
+            custom_title=custom_title,
+        ),
         resume=resume,
         scoring_guide=_scoring_guide(),
+        work_authorization=_check_work_authorization(country, declared),
+        notice=_NO_URL_NOTICE if (url is None and custom_title is None) else None,
     )
