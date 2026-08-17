@@ -21,19 +21,26 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # This repo carries the version in TWO files and they have drifted before.
-      # A tag that disagrees with either would publish something other than what
-      # the tag claims — and there is no taking it back.
-      - name: Tag, pyproject and manifest must agree
+      # This repo carries the version in FOUR files and they have drifted before:
+      # 0.3.0 sat in pyproject/manifest while the plugin still pinned 0.1.2, so
+      # every plugin install kept pulling the old package. A tag that disagrees
+      # with any of them publishes something other than what the tag claims — and
+      # there is no taking it back. The plugin pin matters most: it is the version
+      # users actually run.
+      - name: Tag, package and plugin versions must all agree
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
           MAN=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('manifest.json').read_text(encoding='utf-8'))['version'])")
-          echo "tag=$TAG pyproject=$PKG manifest=$MAN"
-          if [ "$TAG" != "$PKG" ] || [ "$TAG" != "$MAN" ]; then
-            echo "::error::version mismatch — tag=$TAG pyproject=$PKG manifest=$MAN"
-            exit 1
-          fi
+          PLG=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('plugins/runway-mcp/.claude-plugin/plugin.json').read_text(encoding='utf-8'))['version'])")
+          PIN=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('plugins/runway-mcp/.mcp.json').read_text(encoding='utf-8'))['mcpServers']['runway-mcp']['args'][1].split('==')[1])")
+          echo "tag=$TAG pyproject=$PKG manifest=$MAN plugin=$PLG pin=$PIN"
+          for v in "$PKG" "$MAN" "$PLG" "$PIN"; do
+            if [ "$TAG" != "$v" ]; then
+              echo "::error::version mismatch — tag=$TAG pyproject=$PKG manifest=$MAN plugin=$PLG pin=$PIN"
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: pip install -e ".[dev]"

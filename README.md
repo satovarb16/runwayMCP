@@ -379,18 +379,19 @@ PRs welcome.
 
 ## Releasing
 
-Publishing is driven by a tag. Bump the version in **both** `pyproject.toml` and
-`manifest.json`, merge that to `master`, then:
+Publishing is driven by a tag. Bump the version in **all four** places listed in
+[RELEASING.md](RELEASING.md) — `pyproject.toml`, `manifest.json`, the plugin's
+`plugin.json`, and the `runway-mcp==X.Y.Z` pin in the plugin's `.mcp.json` — merge that to
+`master`, then:
 
 ```bash
 git tag v0.3.0
 git push origin v0.3.0
 ```
 
-`.github/workflows/release.yml` takes it from there: it checks that the tag,
-`pyproject.toml` and `manifest.json` all name the same version, runs lint and the
-full test suite on Python 3.11/3.12/3.13, builds the sdist and wheel, runs
-`twine check`, and only then uploads.
+`.github/workflows/release.yml` takes it from there: it checks that the tag and all four
+version sites name the same version, runs lint and the full test suite on Python
+3.11/3.12/3.13, builds the sdist and wheel, runs `twine check`, and only then uploads.
 
 Everything that can fail runs *before* the upload on purpose — PyPI never lets a
 version number be reused, even after a delete, so a bad publish cannot be undone,
