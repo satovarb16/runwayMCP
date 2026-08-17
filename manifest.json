@@ -29,6 +29,8 @@
     "mcp_config": {
       "command": "uvx",
       "args": [
+        "--from",
+        "git+https://github.com/satovarb16/runwayMCP@v0.3.0",
         "runway-mcp"
       ]
     }

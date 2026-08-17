@@ -33,7 +33,9 @@ jobs:
           PKG=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
           MAN=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('manifest.json').read_text(encoding='utf-8'))['version'])")
           PLG=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('plugins/runway-mcp/.claude-plugin/plugin.json').read_text(encoding='utf-8'))['version'])")
-          PIN=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('plugins/runway-mcp/.mcp.json').read_text(encoding='utf-8'))['mcpServers']['runway-mcp']['args'][1].split('==')[1])")
+          # The pin is either a PyPI spec (runway-mcp==X.Y.Z) or a git ref
+          # (git+https://...@vX.Y.Z); both end in the version, so match either.
+          PIN=$(python -c "import json,pathlib,re,sys;spec=json.loads(pathlib.Path('plugins/runway-mcp/.mcp.json').read_text(encoding='utf-8'))['mcpServers']['runway-mcp']['args'][1];m=re.search(r'(?:==|@v?)([0-9]+[.][0-9]+[.][0-9]+)\$',spec);print(m.group(1) if m else sys.exit('cannot read a version out of the plugin pin: '+spec))")
           echo "tag=$TAG pyproject=$PKG manifest=$MAN plugin=$PLG pin=$PIN"
           for v in "$PKG" "$MAN" "$PLG" "$PIN"; do
             if [ "$TAG" != "$v" ]; then
