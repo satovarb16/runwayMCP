@@ -2,12 +2,14 @@
 
 `runway-mcp` ships in two layers that must stay in lockstep:
 
-1. **PyPI package** — the server code (`uvx runway-mcp` runs it).
-2. **Claude Code plugin** — pins an exact package version and is what users install/update.
+1. **Server code** — built by `uvx` from the pinned source (a git tag today, a PyPI
+   release once publishing is unblocked).
+2. **Claude Code plugin** — pins that exact version and is what users install/update.
 
 The plugin's `.mcp.json` pins an exact version, so updating the plugin pulls exactly that
-server build (no stale `uvx` cache). For that to work, **every release bumps the same
-version in all four places below.**
+server build. Every release uses a **new** tag, so the pin changes and `uvx` never serves a
+cached build of the previous one. For that to work, **every release bumps the same version
+in all four places below.**
 
 > **PyPI publishing is currently blocked.** The `pypi` Trusted Publishing publisher was
 > never configured, and the account's 2FA is lost, so the `publish` job fails with
@@ -39,7 +41,7 @@ version in all four places below.**
    uv run --extra dev pytest -q
    claude plugin validate .
    ```
-4. Merge to `master`, then push the tag — **this is what publishes**:
+4. **Push the tag from the release branch, before merging** — this is what publishes:
    ```bash
    git tag vX.Y.Z && git push origin vX.Y.Z
    ```
@@ -47,12 +49,26 @@ version in all four places below.**
    sites, lints, tests on Python 3.11/3.12/3.13, builds, runs `twine check`, and only
    then uploads to PyPI via Trusted Publishing. There is no token to set — do **not**
    `uv publish` by hand.
-5. Merging the bumped `plugin.json` to `master` is the signal Claude Code uses to
-   offer/apply the plugin update — users get the new package version automatically via
-   the pin, without touching PyPI themselves. Publish the package *before* users can pull
-   the pin, or the plugin will point at a version PyPI does not have yet.
+
+   > **Why the tag goes first.** The marketplace serves `master`. The moment the bumped
+   > `.mcp.json` lands there, every new install — and every existing user who runs
+   > `/plugin marketplace update` — resolves that pin. If the tag it names doesn't exist
+   > yet, `uvx` fails outright and the server never starts. Tagging first closes that
+   > window instead of just shortening it. The tag points at the branch tip, where all
+   > four version sites already agree, which is exactly what the gate checks.
+   >
+   > If the run fails *before* the upload step, delete the tag
+   > (`git push origin :vX.Y.Z`), fix, and re-cut it. Once PyPI accepts an upload that
+   > number is burned for good — but nothing is published until every check has passed.
+5. **Then merge to `master`.** That is the signal Claude Code uses to offer/apply the
+   plugin update, and users get the new server build automatically via the pin. A squash
+   merge leaves the tagged commit off `master`'s history; it stays reachable through the
+   tag, so `uvx` still builds it. Use a merge commit if you want it in the history too.
 
 ## Versioning
 
 - A published version on PyPI is immutable — never reuse a number; always bump.
+- **Never move a tag.** `uvx` resolves a git ref once and caches the commit it found, so
+  force-pushing `vX.Y.Z` somewhere new leaves anyone who already installed it building the
+  old commit forever. Cut a new version instead.
 - Bump patch (`Z`) for fixes, minor (`Y`) for features, major (`X`) for breaking changes.

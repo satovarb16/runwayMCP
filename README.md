@@ -389,8 +389,8 @@ Publishing is driven by a tag. Bump the version in **all four** places listed in
 [RELEASING.md](RELEASING.md) — `pyproject.toml`, `manifest.json`, the plugin's
 `plugin.json`, and the version pin in the plugin's `.mcp.json` (currently the git tag
 `git+https://github.com/satovarb16/runwayMCP@vX.Y.Z`; `runway-mcp==X.Y.Z` once PyPI is
-unblocked — the release workflow's version gate accepts either) — merge that to
-`master`, then:
+unblocked — the release workflow's version gate accepts either). Then push the tag
+**from the release branch, before merging to `master`**:
 
 ```bash
 git tag v0.3.0
@@ -400,6 +400,8 @@ git push origin v0.3.0
 `.github/workflows/release.yml` takes it from there: it checks that the tag and all four
 version sites name the same version, runs lint and the full test suite on Python
 3.11/3.12/3.13, builds the sdist and wheel, runs `twine check`, and only then uploads.
+Merge to `master` once the tag is up — the marketplace serves `master`, so a pin that
+lands there before its tag exists breaks every install until the tag catches up.
 
 Everything that can fail runs *before* the upload on purpose — PyPI never lets a
 version number be reused, even after a delete, so a bad publish cannot be undone,
