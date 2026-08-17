@@ -377,6 +377,40 @@ pre-commit install       # runs ruff lint + format before every commit
 
 PRs welcome.
 
+## Releasing
+
+Publishing is driven by a tag. Bump the version in **both** `pyproject.toml` and
+`manifest.json`, merge that to `master`, then:
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+`.github/workflows/release.yml` takes it from there: it checks that the tag,
+`pyproject.toml` and `manifest.json` all name the same version, runs lint and the
+full test suite on Python 3.11/3.12/3.13, builds the sdist and wheel, runs
+`twine check`, and only then uploads.
+
+Everything that can fail runs *before* the upload on purpose — PyPI never lets a
+version number be reused, even after a delete, so a bad publish cannot be undone,
+only superseded.
+
+**One-time setup.** The workflow authenticates with [PyPI Trusted
+Publishing](https://docs.pypi.org/trusted-publishers/) rather than an API token,
+so there is no long-lived secret in the repo. On PyPI, under the project's
+*Publishing* settings, add a pending publisher with:
+
+| Field | Value |
+|---|---|
+| Owner | `satovarb16` |
+| Repository | `runwayMCP` |
+| Workflow | `release.yml` |
+| Environment | `pypi` |
+
+The `pypi` environment also gives you a place to require a manual approval before
+the upload step runs — worth enabling, given the irreversibility.
+
 ## License
 
 [MIT](LICENSE) © satovarb
