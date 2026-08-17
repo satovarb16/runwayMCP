@@ -1,7 +1,7 @@
 {
   "name": "runway-mcp",
-  "description": "MCP server that filters US job postings by technical fit AND visa sponsorship history for international students (F-1/OPT).",
-  "version": "0.1.2",
+  "description": "A memory for your job hunt: which jobs you applied to, what state each is in, and which resume version you sent — plus a live work-authorization warning.",
+  "version": "0.3.0",
   "author": {
     "name": "satovarb"
   },
