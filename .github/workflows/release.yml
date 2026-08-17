@@ -1,0 +1,86 @@
+name: Release
+
+# Publishing is irreversible: PyPI never lets a version number be reused, even
+# after a delete. So everything that can fail runs BEFORE the upload, and the
+# upload itself sits behind a protected environment.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # This repo carries the version in TWO files and they have drifted before.
+      # A tag that disagrees with either would publish something other than what
+      # the tag claims — and there is no taking it back.
+      - name: Tag, pyproject and manifest must agree
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          MAN=$(python -c "import json,pathlib;print(json.loads(pathlib.Path('manifest.json').read_text(encoding='utf-8'))['version'])")
+          echo "tag=$TAG pyproject=$PKG manifest=$MAN"
+          if [ "$TAG" != "$PKG" ] || [ "$TAG" != "$MAN" ]; then
+            echo "::error::version mismatch — tag=$TAG pyproject=$PKG manifest=$MAN"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Run tests
+        run: pytest
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+
+    # Trusted Publishing: PyPI verifies this workflow's OIDC identity instead of
+    # a long-lived API token, so there is no secret to leak or rotate. Requires a
+    # one-time pending publisher configured on PyPI — see the README release note.
+    permissions:
+      id-token: write
+      contents: read
+
+    # Add required reviewers to this environment in the repo settings to gate the
+    # upload behind a manual approval.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/runway-mcp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+
+      # Catches a malformed description or bad metadata before the upload rather
+      # than after, when the version is already burned.
+      - name: Check the built artifacts
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
