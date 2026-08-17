@@ -197,10 +197,22 @@ class TestNoJdTextParameter:
 
         assert result.error is None
 
-    def test_sc34_passing_jd_text_is_rejected_not_silently_accepted(self, db_path):
-        """A naive implementation that accepts and ignores extra kwargs
-        would quietly let the JD travel a second time — exactly the doubled
-        payload cost D2 exists to avoid."""
+    def test_analyze_job_declares_no_jd_text_parameter(self, db_path):
+        """The signature has no jd_text, so a direct Python call rejects it.
+
+        This pins the SIGNATURE, and nothing more. SC-34 originally claimed
+        analyze_job "rejects" an unexpected jd_text, and this test was read as
+        proof of that. It is not: over the MCP wire the argument never reaches
+        the function at all — FastMCP validates a call against the tool's
+        advertised JSON schema and drops unrecognised fields before dispatch,
+        so there is nothing left to reject. Verified against a live stdio
+        server; see test_wire_contract.py, which pins what the transport
+        actually does guarantee.
+
+        SC-34 was withdrawn from the spec for that reason: a scenario that
+        cannot hold where callers actually live is worse than no scenario,
+        because it reads as a promise.
+        """
         _save_base_resume()
         from tools.analyze import analyze_job
 
