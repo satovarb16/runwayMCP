@@ -5,9 +5,17 @@
 1. **PyPI package** — the server code (`uvx runway-mcp` runs it).
 2. **Claude Code plugin** — pins an exact package version and is what users install/update.
 
-The plugin's `.mcp.json` pins `runway-mcp==X.Y.Z`, so updating the plugin pulls the
-exact matching package version (no stale `uvx` cache). For that to work, **every release
-bumps the same version in all four places below.**
+The plugin's `.mcp.json` pins an exact version, so updating the plugin pulls exactly that
+server build (no stale `uvx` cache). For that to work, **every release bumps the same
+version in all four places below.**
+
+> **PyPI publishing is currently blocked.** The `pypi` Trusted Publishing publisher was
+> never configured, and the account's 2FA is lost, so the `publish` job fails with
+> `invalid-publisher` on every tag. Until the account is recovered, the plugin pins the
+> **git tag** (`git+https://github.com/satovarb16/runwayMCP@vX.Y.Z`) instead of the PyPI
+> spec (`runway-mcp==X.Y.Z`), and the latest release on PyPI stays at `0.1.2`. The
+> version gate accepts either pin form, so switching back is a one-line change to
+> `plugins/runway-mcp/.mcp.json`.
 
 ## Release checklist
 
@@ -15,13 +23,17 @@ bumps the same version in all four places below.**
    - `pyproject.toml` → `version`
    - `manifest.json` → `version` (Desktop Extension)
    - `plugins/runway-mcp/.claude-plugin/plugin.json` → `version` (plugin update signal)
-   - `plugins/runway-mcp/.mcp.json` → `--from runway-mcp==X.Y.Z` (package pin)
+   - `plugins/runway-mcp/.mcp.json` → the `--from` pin (currently
+     `git+https://github.com/satovarb16/runwayMCP@vX.Y.Z`; `runway-mcp==X.Y.Z` once PyPI
+     works again)
 2. Verify they all match:
    ```bash
-   grep -h '"version"\|^version' pyproject.toml manifest.json \
+   rg -I '"version"|^version' pyproject.toml manifest.json \
      plugins/runway-mcp/.claude-plugin/plugin.json
-   grep 'runway-mcp==' plugins/runway-mcp/.mcp.json
+   rg -o '(==|@v)[0-9]+\.[0-9]+\.[0-9]+' plugins/runway-mcp/.mcp.json
    ```
+   CI re-checks this on every tag and refuses to publish on a mismatch, so this step is
+   a convenience, not the safety net.
 3. Sanity-check locally (CI runs all of this again before it uploads):
    ```bash
    uv run --extra dev pytest -q

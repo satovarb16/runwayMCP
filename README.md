@@ -40,13 +40,18 @@ Create a `.mcp.json` file in the directory where you run Claude Code:
   "mcpServers": {
     "runway-mcp": {
       "command": "uvx",
-      "args": ["runway-mcp"]
+      "args": ["--from", "git+https://github.com/satovarb16/runwayMCP@v0.3.0", "runway-mcp"]
     }
   }
 }
 ```
 
-That's it. Open Claude Code — `uvx` downloads and runs the server automatically.
+That's it. Open Claude Code — `uvx` builds and runs the server automatically.
+
+> **Why the git URL and not plain `uvx runway-mcp`?** The latest release on PyPI is
+> `0.1.2` — a much older server, from before the SQLite rewrite, with a tool set that no
+> longer matches this README. Installing from the tag gets you the current version.
+> See [Releasing](#releasing).
 
 > **Don't have `uv`?** Install it: `pip install uv` (or see [uv docs](https://docs.astral.sh/uv/getting-started/installation/))
 
@@ -58,7 +63,8 @@ cd runwayMCP
 pip install -e ".[dev]"
 ```
 
-Then use `python -m server` instead of `uvx runway-mcp` in your `.mcp.json`, and add `"cwd": "/path/to/runwayMCP"`.
+Then use `python -m server` in place of the `uvx` command and its `--from` arguments in
+your `.mcp.json`, and add `"cwd": "/path/to/runwayMCP"`.
 
 <!-- historical:start -->
 ## Why runwayMCP doesn't fetch job postings, and never checked visa sponsorship this way

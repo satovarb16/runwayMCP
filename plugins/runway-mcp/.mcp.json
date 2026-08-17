@@ -2,7 +2,11 @@
   "mcpServers": {
     "runway-mcp": {
       "command": "uvx",
-      "args": ["--from", "runway-mcp==0.3.0", "runway-mcp"]
+      "args": [
+        "--from",
+        "git+https://github.com/satovarb16/runwayMCP@v0.3.0",
+        "runway-mcp"
+      ]
     }
   }
 }
