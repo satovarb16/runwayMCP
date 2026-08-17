@@ -398,18 +398,30 @@ only superseded.
 
 **One-time setup.** The workflow authenticates with [PyPI Trusted
 Publishing](https://docs.pypi.org/trusted-publishers/) rather than an API token,
-so there is no long-lived secret in the repo. On PyPI, under the project's
-*Publishing* settings, add a pending publisher with:
+so there is no long-lived secret in the repo to leak or rotate. GitHub signs a
+short-lived token per run and PyPI verifies the signature.
+
+`runway-mcp` already exists on PyPI, so this is a publisher on an existing
+project — not a *pending* publisher, which is the separate flow for a name that
+has never been published. Go to
+<https://pypi.org/manage/project/runway-mcp/settings/publishing/>, choose
+**GitHub** under *Add a new publisher*, and fill in exactly:
 
 | Field | Value |
 |---|---|
 | Owner | `satovarb16` |
-| Repository | `runwayMCP` |
-| Workflow | `release.yml` |
-| Environment | `pypi` |
+| Repository name | `runwayMCP` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
 
-The `pypi` environment also gives you a place to require a manual approval before
-the upload step runs — worth enabling, given the irreversibility.
+All four must match or PyPI rejects the token — the environment name in
+particular, since it is what scopes the trust to the gated job rather than to
+any workflow in the repo.
+
+On the GitHub side, the `pypi` environment is created automatically the first
+time the workflow runs. Create it yourself under *Settings → Environments* if you
+want to add required reviewers first, which gates the upload behind a manual
+approval — worth doing, given that a published version can never be reused.
 
 ## License
 
