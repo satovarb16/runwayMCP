@@ -1,7 +1,7 @@
 # runwayMCP
 
-[![PyPI](https://img.shields.io/pypi/v/runway-mcp.svg)](https://pypi.org/project/runway-mcp/)
-[![Python](https://img.shields.io/pypi/pyversions/runway-mcp.svg)](https://pypi.org/project/runway-mcp/)
+[![Release](https://img.shields.io/github/v/tag/satovarb16/runwayMCP?label=release)](https://github.com/satovarb16/runwayMCP/releases)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 runwayMCP is a memory for your job hunt. You paste a job description into the conversation;
@@ -29,7 +29,7 @@ Claude Code wires up the MCP server for you — no JSON to edit.
 ```
 
 Then run `/reload-plugins` (or restart Claude Code) to load the new version. The plugin
-pins an exact package version, so updating it pulls the matching server release.
+pins an exact release tag, so updating it pulls the matching server release.
 
 ### Option B: manual `.mcp.json`
 
@@ -387,7 +387,9 @@ PRs welcome.
 
 Publishing is driven by a tag. Bump the version in **all four** places listed in
 [RELEASING.md](RELEASING.md) — `pyproject.toml`, `manifest.json`, the plugin's
-`plugin.json`, and the `runway-mcp==X.Y.Z` pin in the plugin's `.mcp.json` — merge that to
+`plugin.json`, and the version pin in the plugin's `.mcp.json` (currently the git tag
+`git+https://github.com/satovarb16/runwayMCP@vX.Y.Z`; `runway-mcp==X.Y.Z` once PyPI is
+unblocked — the release workflow's version gate accepts either) — merge that to
 `master`, then:
 
 ```bash
