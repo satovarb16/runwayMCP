@@ -24,6 +24,8 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+# Git Bash on Windows drops these next to the cwd when a shell crashes
+*.stackdump
 
 # Local Claude Code overrides (keep .claude/settings.json as example config)
 .claude/settings.local.json
